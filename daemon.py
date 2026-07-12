@@ -248,6 +248,7 @@ class HistoryIndexer:
 
         # Read and index entire file (INSERT OR IGNORE handles duplicates)
         records_added = 0
+        tool_names = {}  # tool_use_id -> tool_name, to label tool_output records
         try:
             with open(file_path, 'rb') as f:
                 while True:
@@ -258,7 +259,16 @@ class HistoryIndexer:
 
                     try:
                         rec = json.loads(line)
+                        # Agent files carry their parent session in each record
+                        rec_session = rec.get('sessionId') if is_agent else session_id
                         for vr in expand_record(rec, agent_id=agent_id):
+                            tool_name = vr.get('tool_name')
+                            tool_use_id = vr.get('tool_use_id', '')
+                            vtype = vr.get('type', '')
+                            if tool_use_id and vtype.endswith('tool_input'):
+                                tool_names[tool_use_id] = tool_name
+                            elif tool_use_id and vtype.endswith('tool_output') and tool_name is None:
+                                tool_name = tool_names.get(tool_use_id)
                             self.db.execute("""
                                 INSERT OR IGNORE INTO records
                                 (uuid, timestamp, record_type, tool_name, tool_use_id, content,
@@ -268,11 +278,11 @@ class HistoryIndexer:
                                 vr.get('uuid'),
                                 vr.get('timestamp'),
                                 vr.get('type'),
-                                vr.get('tool_name'),
-                                vr.get('tool_use_id', ''),
+                                tool_name,
+                                tool_use_id,
                                 vr.get('content', ''),
                                 project_name,
-                                session_id if not is_agent else None,
+                                rec_session,
                                 agent_id,
                                 str(file_path),
                                 line_start

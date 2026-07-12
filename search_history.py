@@ -265,6 +265,8 @@ def db_available():
 
 def search_sqlite(
     term=None,
+    matcher=None,
+    is_regex=True,
     type_list=None,
     tool=None,
     time_from=None,
@@ -274,35 +276,26 @@ def search_sqlite(
     agent_id=None,
     ignore_case=False,
 ):
-    """Search records using SQLite FTS5."""
+    """Search records in SQLite.
+
+    Content is prefiltered in SQL with LIKE conditions derived from the term
+    (a superset of the real matcher's semantics), then every row is verified
+    with `matcher` so results are identical to the JSONL path.
+    """
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
 
     params = []
     conditions = []
+    sql = "SELECT * FROM records WHERE 1=1"
 
-    # Base query - join with FTS if we have a search term
+    # Content prefilter (never excludes true matches; matcher verifies below)
     if term:
-        # Check if term contains regex metacharacters
-        if _is_regex(term):
-            # Extract FTS query from regex (handles AND/OR)
-            fts_query = _extract_fts_query(term)
-        else:
-            # Simple literal search
-            fts_query = f'"{term.replace(chr(34), chr(34)+chr(34))}"'
-
-        if fts_query:
-            sql = """
-                SELECT r.* FROM records r
-                JOIN records_fts ON r.id = records_fts.rowid
-                WHERE records_fts MATCH ?
-            """
-            params.append(fts_query)
-        else:
-            # No usable FTS query (regex too complex), full scan
-            sql = "SELECT * FROM records WHERE 1=1"
-    else:
-        sql = "SELECT * FROM records WHERE 1=1"
+        prefilter = _term_to_like(term, is_regex, ignore_case)
+        if prefilter:
+            like_sql, like_params = prefilter
+            conditions.append(like_sql)
+            params.extend(like_params)
 
     # Type filter
     if type_list:
@@ -353,20 +346,66 @@ def search_sqlite(
 
     db.close()
 
-    # Convert to expected format
+    # Convert to expected format, verifying content against the real matcher
     results = []
     for row in rows:
+        content = row["content"] or ""
+        if matcher and not matcher(content):
+            continue
         results.append({
             "uuid": row["uuid"] or "",
             "timestamp": row["timestamp"] or "",
             "type": row["record_type"],
             "tool_name": row["tool_name"],
-            "content": row["content"] or "",
+            "content": content,
             "agent_id": row["agent_id"],
             "session_id": row["session_id"] or row["project_name"],
         })
 
     return results
+
+
+def _term_to_like(term, is_regex, ignore_case):
+    """Build a SQL LIKE prefilter for a search term, or None for no prefilter.
+
+    The prefilter must be a superset of the matcher: LIKE is substring-based
+    (unlike token-based FTS) and ASCII-case-insensitive, so it can only ever
+    over-match. Non-ASCII terms with -i get no prefilter (LIKE is
+    case-sensitive beyond ASCII, which could drop true matches).
+    """
+    if ignore_case and any(ord(c) > 127 for c in term):
+        return None
+    if is_regex and _is_regex(term):
+        return _tree_to_like(_extract_fts_tree(term))
+    return _tree_to_like(('LIT', term))
+
+
+def _tree_to_like(node):
+    """Convert an extracted literal tree to (sql_condition, params) or None."""
+    if node is None:
+        return None
+
+    if node[0] == 'LIT':
+        esc = node[1].replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        return ("content LIKE ? ESCAPE '\\'", [f"%{esc}%"])
+
+    if node[0] == 'AND':
+        # Dropping an unconvertible AND-part only weakens the filter (still a superset)
+        subs = [s for s in (_tree_to_like(n) for n in node[1]) if s]
+        if not subs:
+            return None
+        return ("(" + " AND ".join(s[0] for s in subs) + ")",
+                [p for s in subs for p in s[1]])
+
+    if node[0] == 'OR':
+        # A dropped OR branch would exclude true matches, so all must convert
+        subs = [_tree_to_like(n) for n in node[1]]
+        if not subs or any(s is None for s in subs):
+            return None
+        return ("(" + " OR ".join(s[0] for s in subs) + ")",
+                [p for s in subs for p in s[1]])
+
+    return None
 
 
 def search_snapshots_sqlite(
@@ -622,9 +661,21 @@ def _print_expanded_result(result, agent_id=None):
 
 
 def run_get_snapshot(args):
-    """Get raw content of a snapshot by backup ID."""
+    """Get raw content of a snapshot by backup ID.
+
+    IDs look like "7f35193717348549@v1"; the hash part may be given as a
+    prefix ("7f3519@v1"), but the version must match exactly if present.
+    """
     snapshots = list_snapshots(None, args.cwd)
-    matches = [s for s in snapshots if s['id'].startswith(args.get_snapshot)]
+    if "@" in args.get_snapshot:
+        hash_prefix, _, version = args.get_snapshot.partition("@")
+        def id_matches(sid):
+            sid_hash, _, sid_version = sid.partition("@")
+            return sid_hash.startswith(hash_prefix) and sid_version == version
+    else:
+        def id_matches(sid):
+            return sid.startswith(args.get_snapshot)
+    matches = [s for s in snapshots if id_matches(s['id'])]
     if not matches:
         print(f"No snapshot found with ID starting with '{args.get_snapshot}'", file=sys.stderr)
         sys.exit(1)
@@ -722,22 +773,16 @@ def run_search(args):
         print(f"No types match pattern: {args.type}")
         return
 
-    # Normalize grep BRE-style escapes to Python ERE in regex mode:
-    # \| → | (alternation), \( → (, \) → ), \{ → {, \} → }
-    # This makes the tool intuitive for both grep-style and Python-style users.
-    if args.term and args.regex:
-        args.term = re.sub(r'\\([|(){}])', r'\1', args.term)
+    # Compile search pattern (validates regex before either backend runs)
+    matcher = compile_search_pattern(args.term, args.ignore_case, args.regex)
 
     # Try SQLite first (unless context mode, which needs JSONL for now)
     if not args.context and db_available():
-        results = _run_search_sqlite(args, type_list, time_from, time_to)
+        results = _run_search_sqlite(args, type_list, time_from, time_to, matcher)
         if results is not None:
             _display_results(results, args)
             return
         # Fall through to JSONL if SQLite failed
-
-    # Compile search pattern
-    matcher = compile_search_pattern(args.term, args.ignore_case, args.regex)
 
     # Determine which sources to search based on matching types
     search_main = type_list is None or any(t in MAIN_TYPES for t in type_list)
@@ -854,8 +899,13 @@ def run_search(args):
             print()
 
 
-def _run_search_sqlite(args, type_list, time_from, time_to):
+def _run_search_sqlite(args, type_list, time_from, time_to, matcher):
     """Run search using SQLite. Returns results or None to fall back to JSONL."""
+    # Match the JSONL path's default scope: main types only, plus agent types
+    # when --agent is given. Agent/plan records require an explicit -t.
+    if type_list is None:
+        type_list = MAIN_TYPES + (AGENT_TYPES if args.agent else [])
+
     # Determine project filter
     project_name = None
     session_id = args.session if hasattr(args, 'session') and args.session else None
@@ -876,6 +926,8 @@ def _run_search_sqlite(args, type_list, time_from, time_to):
 
     results = search_sqlite(
         term=args.term,
+        matcher=matcher,
+        is_regex=args.regex,
         type_list=type_list,
         tool=args.tool,
         time_from=time_from,
