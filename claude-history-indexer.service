@@ -1,0 +1,24 @@
+[Unit]
+Description=Claude Code History Indexer
+Documentation=https://github.com/anthropics/claude-code
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/nice -n 19 %h/.local/bin/uv run %h/.claude/skills/search-history/daemon.py
+Nice=19
+IOSchedulingClass=idle
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+MemoryMax=256M
+CPUQuota=10%
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
