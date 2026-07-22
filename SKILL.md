@@ -110,7 +110,10 @@ Changes in example.py:
 Selectors: N (hunk) | N.M (sub-hunk) | N.M.L (line) | N.{1..3} (range)
 
 $ ~/.claude/skills/git-staging/stage-hunks.py example.py 1.1.1 2.1
-Staged: 1.1.1, 2.1
+Staged: +3/-0 lines across 2 hunk(s)
+Remaining unstaged in example.py (IDs renumbered):
+  [1] +    """Perform basic arithmetic operations."""
+  [2] +        self.history.clear()
 
 $ git diff --staged
 diff --git a/example.py b/example.py
@@ -160,7 +163,16 @@ git commit -m "message"
 
 ## Important
 
-After staging some hunks from a file, the remaining unstaged hunks are renumbered. Always re-run `--print` before staging more hunks from the same file.
+- After staging some hunks from a file, the remaining unstaged hunks are
+  **renumbered**. Every successful staging prints the remaining hunks with
+  their fresh IDs; still re-run `--print` before composing sub-hunk or
+  line-level selectors from the same file.
+- Selectors are **validated**: any selector (or range element) that matches
+  no existing change aborts the whole operation with exit code 1 and stages
+  nothing — a stale ID from before a renumbering cannot be silently ignored.
+- The `Staged:` line reports what was actually staged (counted from the
+  applied patch), not an echo of your arguments. If the counts don't match
+  your intent, inspect with `git diff --staged` before committing.
 
 ## Limitations
 

@@ -323,32 +323,93 @@ def build_patch(u3_hunks: list, file_header: str, selections: set) -> str:
     return "\n".join(patch_lines) + "\n"
 
 
+def existing_coordinates(u3_hunks: list) -> set:
+    """Collect every addressable (u3, u0, line) coordinate in the diff."""
+    coords = set()
+    for hunk in u3_hunks:
+        for dl in hunk:
+            if dl.line_type in ("+", "-"):
+                coords.add((dl.u3_idx, None, None))
+                coords.add((dl.u3_idx, dl.u0_idx, None))
+                coords.add((dl.u3_idx, dl.u0_idx, dl.line_idx))
+    return coords
+
+
+def selector_id(item: tuple) -> str:
+    """Human-readable form of a (u3, u0, line) selection tuple."""
+    return ".".join(str(part) for part in item if part is not None)
+
+
+def print_remaining(filepath: str):
+    """Show what is still unstaged after a staging operation.
+
+    Numbering shifts after every staging, so this doubles as the fresh
+    ID listing and makes forgotten related hunks visible immediately.
+    """
+    u3_hunks, _ = build_hierarchy(filepath)
+    if not u3_hunks:
+        print(f"All changes in {filepath} staged.")
+        return
+    print(f"Remaining unstaged in {filepath} (IDs renumbered):")
+    for hunk in u3_hunks:
+        first_change = next(
+            (dl.content for dl in hunk if dl.line_type in ("+", "-")), ""
+        )
+        header = next((dl for dl in hunk if dl.line_type == "@@"), None)
+        u3 = header.u3_idx if header else "?"
+        print(f"  [{u3}] {first_change[:70]}")
+
+
 def stage_selections(filepath: str, selectors: list[str]):
-    """Stage the selected hunks/lines."""
+    """Stage the selected hunks/lines.
+
+    Every selector must resolve to at least one existing change; stale or
+    mistyped selectors (e.g. numbering shifted after an earlier staging)
+    abort the whole operation so nothing is staged partially.
+    """
     u3_hunks, file_header = build_hierarchy(filepath)
 
     if not u3_hunks:
         print(f"No changes in {filepath}")
         return
 
-    # Expand all selectors
+    # Expand all selectors, remembering which original selector each
+    # expanded selection came from (for error reporting)
     selections = set()
+    dead = []
 
     # Handle --all: select all U3 hunks
     if "--all" in selectors or "-a" in selectors:
         for i in range(1, len(u3_hunks) + 1):
             selections.add((i, None, None))
     else:
+        coords = existing_coordinates(u3_hunks)
         for sel in selectors:
-            for item in parse_selector(sel):
-                selections.add(item)
+            try:
+                items = parse_selector(sel)
+            except (ValueError, IndexError):
+                print(f"Error: malformed selector '{sel}'")
+                sys.exit(1)
+            missing = [item for item in items if item not in coords]
+            if missing:
+                dead.append((sel, missing))
+            selections.update(items)
+
+    if dead:
+        print("Error: selectors that match nothing (numbering may have "
+              "shifted since your last --print):")
+        for sel, missing in dead:
+            ids = ", ".join(selector_id(m) for m in missing)
+            print(f"  '{sel}' -> no such change: {ids}")
+        print("Nothing was staged. Re-run --print for current IDs.")
+        sys.exit(1)
 
     # Build and apply patch
     patch = build_patch(u3_hunks, file_header, selections)
 
     if not patch.strip():
         print("No valid selections matched")
-        return
+        sys.exit(1)
 
     # Apply the patch
     proc = subprocess.run(
@@ -363,8 +424,20 @@ def stage_selections(filepath: str, selectors: list[str]):
         print(proc.stderr)
         print("\nPatch was:")
         print(patch)
-    else:
-        print(f"Staged: {', '.join(selectors)}")
+        sys.exit(1)
+
+    # Report what was actually staged, counted from the patch itself
+    plus = sum(
+        1 for ln in patch.splitlines()
+        if ln.startswith("+") and not ln.startswith("+++")
+    )
+    minus = sum(
+        1 for ln in patch.splitlines()
+        if ln.startswith("-") and not ln.startswith("---")
+    )
+    n_hunks = sum(1 for ln in patch.splitlines() if ln.startswith("@@"))
+    print(f"Staged: +{plus}/-{minus} lines across {n_hunks} hunk(s)")
+    print_remaining(filepath)
 
 
 def main():
