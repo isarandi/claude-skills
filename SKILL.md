@@ -14,40 +14,51 @@ Stage specific changes with 3-level granularity: U3 hunk > U0 sub-hunk > individ
 ## Quick Start
 
 ```bash
-# Overview of all changed files
-~/.claude/skills/git-staging/stage-hunks.py --print
+S=~/.claude/skills/git-staging/stage-hunks.py
 
-# List one file's changes with IDs (stores the numbering)
-~/.claude/skills/git-staging/stage-hunks.py src/file.py --print
+$S --print                      # Overview of all changed files
+$S src/file.py --renumber       # Establish numbering: ack + outline
+$S src/file.py --outline        # The map: one line per hunk, staged counts
+$S src/file.py --find 'regex'   # Which IDs touch this content?
+$S src/file.py --print          # Full listing, staged lines marked with ✓
+$S src/file.py --print 2 5      # Full detail of hunks 2 and 5 only
 
-# Stage by selector
-~/.claude/skills/git-staging/stage-hunks.py src/file.py 2.1.3
-
-# Stage everything / everything except some IDs
-~/.claude/skills/git-staging/stage-hunks.py src/file.py --all
-~/.claude/skills/git-staging/stage-hunks.py src/file.py --all-except 3 5.2
-
-# Undo a staging by the same IDs
-~/.claude/skills/git-staging/stage-hunks.py src/file.py --unstage 3
-
-# Preview without touching the index
-~/.claude/skills/git-staging/stage-hunks.py src/file.py 2 --dry-run
+$S src/file.py 2.1.3            # Stage line 3 of sub-hunk 2.1
+$S src/file.py --all            # Stage everything
+$S src/file.py --all-except 3 5.2
+$S src/file.py --unstage 3      # Undo, by the same IDs
+$S src/file.py 2 --dry-run      # Preview the patch, touch nothing
 ```
 
-## Persistent IDs
+## Persistent numbering
 
-Every `--print` of a file **stores its numbering** (in `.git/stage-hunks/`).
-Selectors always refer to the numbering of the **last `--print`** of that
-file — staging never renumbers anything, so you can print once and stage
-many commits' worth of hunks from the same listing, even with `git commit`
-runs in between. Only two things establish a new frame of reference:
+**`--renumber` is the only operation that (re)numbers.** It stores the
+numbering (in `.git/stage-hunks/`), prints a short acknowledgment plus the
+outline (combine with `--print` or `--find` for a different first view).
+Everything else — `--print`, `--outline`, `--find`, staging, unstaging —
+renders and resolves in that stored frame and never renumbers, so one
+numbering serves a whole series of commits, including with `git commit`
+runs in between. `--print` marks already-staged lines with `✓`.
 
-- a new `--print` of the file, or
-- editing the file, which invalidates the stored numbering (the tool then
-  refuses selectors until you re-print).
+Two rules complete the picture:
+
+- First contact with a file (no stored numbering yet) establishes one
+  implicitly — no ceremony for the common case.
+- Editing the file invalidates the stored numbering (content hash check);
+  every operation then refuses until you run `--renumber`.
 
 Re-staging an already-staged ID is an error, stale IDs are an error, and
 nothing is ever staged partially on a failed call.
+
+## Typical agent workflow
+
+```bash
+$S src/file.py --renumber              # once: numbering + outline
+$S src/file.py --find 'helper_name'    # map content -> IDs (no grepping)
+$S src/file.py 3 5.2 && git commit -m "first commit"
+$S src/file.py --outline               # what's left, same IDs
+$S src/file.py --all && git commit -m "second commit"
+```
 
 ## Display Format
 
@@ -161,8 +172,8 @@ diff --git a/example.py b/example.py
 ## Workflow
 
 ```bash
-# 1. View changes with IDs
-~/.claude/skills/git-staging/stage-hunks.py src/file.py --print
+# 1. Establish numbering and see the outline
+~/.claude/skills/git-staging/stage-hunks.py src/file.py --renumber
 
 # 2. Stage specific changes (repeatable with the same numbering)
 ~/.claude/skills/git-staging/stage-hunks.py src/file.py 1.1 2.3.{1..2}
@@ -173,7 +184,7 @@ git diff --staged
 # 4. Commit
 git commit -m "message"
 
-# 5. Keep staging the next commit from the SAME numbering - no re-print needed
+# 5. Keep staging the next commit from the SAME numbering - no renumbering
 ~/.claude/skills/git-staging/stage-hunks.py src/file.py 3 4.1
 ```
 

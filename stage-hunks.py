@@ -257,25 +257,47 @@ def worktree_sha(filepath: str) -> str:
 def save_snapshot(filepath: str, u3_hunks: list) -> dict:
     prestaged = bool(run_git(["diff", "--cached", "--name-only", "--", filepath]).strip())
     snap = {
+        "version": 2,
         "file": filepath,
         "worktree_sha": worktree_sha(filepath),
         "prestaged": prestaged,
-        "leaves": [
-            {"id": [dl.u3_idx, dl.u0_idx, dl.line_idx], "key": list(leaf_key(dl))}
-            for dl in iter_leaves(u3_hunks)
+        # Full listing (including context) so read views can render the
+        # stored frame even after parts of it were staged away
+        "hunks": [
+            [
+                {"t": dl.line_type, "c": dl.content, "u3": dl.u3_idx,
+                 "u0": dl.u0_idx, "li": dl.line_idx, "nl": dl.new_ln}
+                for dl in hunk
+            ]
+            for hunk in u3_hunks
         ],
     }
+    _attach_leaves(snap)
     with open(snapshot_path(filepath), "w") as f:
-        json.dump(snap, f)
+        json.dump({k: v for k, v in snap.items() if k != "leaves"}, f)
     return snap
+
+
+def _attach_leaves(snap: dict) -> None:
+    """Derive the leaf list (selection targets) from the stored hunks."""
+    snap["leaves"] = [
+        {"id": [ln["u3"], ln["u0"], ln["li"]], "key": [ln["t"], ln["nl"], ln["c"]]}
+        for hunk in snap["hunks"]
+        for ln in hunk
+        if ln["t"] in ("+", "-")
+    ]
 
 
 def load_snapshot(filepath: str) -> dict | None:
     try:
         with open(snapshot_path(filepath)) as f:
-            return json.load(f)
+            snap = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+    if snap.get("version") != 2:
+        return None
+    _attach_leaves(snap)
+    return snap
 
 
 def get_or_create_snapshot(filepath: str) -> dict:
@@ -293,9 +315,9 @@ def get_or_create_snapshot(filepath: str) -> dict:
             sys.exit(1)
         return save_snapshot(filepath, u3_hunks)
     if snap["worktree_sha"] != worktree_sha(filepath):
-        print(f"Error: {filepath} was modified since the last --print; "
-              f"its stored numbering no longer matches the file.")
-        print("Re-run --print to get fresh IDs.")
+        print(f"Error: {filepath} was modified since its numbering was "
+              f"established; the stored IDs no longer match the file.")
+        print("Run --renumber to establish fresh IDs.")
         sys.exit(1)
     return snap
 
@@ -303,38 +325,153 @@ def get_or_create_snapshot(filepath: str) -> dict:
 # ── Display ──────────────────────────────────────────────────────────
 
 
-def display_hunks(filepath: str):
-    """Display all hunks with 3-level IDs and store the numbering."""
-    u3_hunks, file_header = build_hierarchy(filepath)
+def staged_marks(snap: dict) -> dict:
+    """Map id(leaf) -> True when that leaf is no longer in the unstaged diff."""
+    u3_hunks, _ = build_hierarchy(snap["file"])
+    assignment = assign_snapshot_to_current(snap, u3_hunks)
+    return {id(leaf): dl is None for leaf, dl in zip(snap["leaves"], assignment)}
 
+
+def _iter_snap_lines(snap: dict):
+    """Yield (line_dict, leaf_or_None) walking the stored listing in order."""
+    leaf_iter = iter(snap["leaves"])
+    for hunk in snap["hunks"]:
+        for ln in hunk:
+            leaf = next(leaf_iter) if ln["t"] in ("+", "-") else None
+            yield ln, leaf
+
+
+def read_view_snapshot(filepath: str) -> dict:
+    """Load the frame for a read view; create one only if none exists."""
+    return get_or_create_snapshot(filepath)
+
+
+def print_full(filepath: str, selectors: list[str] | None = None):
+    """Render the stored frame with live staged status.
+
+    With selectors, show only the hunks they refer to.
+    """
+    snap = read_view_snapshot(filepath)
+    marks = staged_marks(snap)
+
+    wanted_u3 = None
+    if selectors:
+        chosen = resolve_selectors(snap, selectors, all_except=False)
+        wanted_u3 = {leaf["id"][0] for leaf in chosen}
+
+    n_lines = 0
+    n_staged = 0
+    for ln, leaf in _iter_snap_lines(snap):
+        if leaf is not None:
+            n_lines += 1
+            if marks.get(id(leaf)):
+                n_staged += 1
+
+    print(f"Changes in {filepath} (stored numbering; {n_staged}/{n_lines} "
+          f"change lines staged):")
+    print()
+    for ln, leaf in _iter_snap_lines(snap):
+        u3 = ln["u3"]
+        if wanted_u3 is not None and u3 not in wanted_u3:
+            continue
+        if ln["t"] == "@@":
+            print("━" * 60)
+            print(f"[{u3}] {ln['c']}")
+            print("━" * 60)
+        elif leaf is not None:
+            idx_str = f"[{ln['u3']}.{ln['u0']}.{ln['li']}]"
+            mark = "✓" if marks.get(id(leaf)) else " "
+            print(f"{idx_str:12}{mark} {ln['c']}")
+        else:
+            print(f"{'':13}{ln['c']}")
+    print()
+    print("Selectors: N (hunk) | N.M (sub-hunk) | N.M.L (line) | N.{1..3} (range)"
+          "  |  ✓ = staged")
+    if n_lines > 60 and wanted_u3 is None:
+        print(f"({len(snap['hunks'])} hunks - try --outline for the map, "
+              f"--find <regex> to locate content)")
+
+
+def print_outline(filepath: str):
+    """One line per hunk: header, counts, staged status, first change."""
+    snap = read_view_snapshot(filepath)
+    marks = staged_marks(snap)
+
+    print(f"Outline of {filepath} (stored numbering):")
+    for hunk in snap["hunks"]:
+        u3 = hunk[0]["u3"]
+        leaves = [ln for ln in hunk if ln["t"] in ("+", "-")]
+        plus = sum(1 for ln in leaves if ln["t"] == "+")
+        minus = sum(1 for ln in leaves if ln["t"] == "-")
+        subs = len({ln["u0"] for ln in leaves})
+        header = hunk[0]["c"] if hunk[0]["t"] == "@@" else ""
+        ctx = re.sub(r"@@ [^@]* @@", "", header).strip()
+        first = leaves[0]["c"] if leaves else ""
+        # Count staged among this hunk's leaves
+        hunk_leaf_ids = []
+        for ln, leaf in _iter_snap_lines(snap):
+            if leaf is not None and ln["u3"] == u3:
+                hunk_leaf_ids.append(id(leaf))
+        staged = sum(1 for lid in hunk_leaf_ids if marks.get(lid))
+        status = f", {staged}/{len(hunk_leaf_ids)} staged" if staged else ""
+        loc = re.search(r"@@ ([^@]*) @@", header)
+        loc_str = loc.group(1).strip() if loc else ""
+        ctx_str = f" {ctx}" if ctx else ""
+        print(f"  [{u3}] {loc_str}{ctx_str}  (+{plus}/-{minus}, "
+              f"{subs} sub-hunk(s){status})  {first[:50]}")
+
+
+def print_find(filepath: str, pattern: str):
+    """Show changed lines matching a regex, with their stored IDs."""
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        print(f"Error: invalid regex '{pattern}': {e}")
+        sys.exit(1)
+    snap = read_view_snapshot(filepath)
+    marks = staged_marks(snap)
+
+    matches = []
+    for ln, leaf in _iter_snap_lines(snap):
+        if leaf is not None and regex.search(ln["c"][1:]):
+            matches.append((ln, leaf))
+    if not matches:
+        print(f"No changed lines in {filepath} match '{pattern}'.")
+        return
+    print(f"Matches in {filepath} (stored numbering):")
+    last_u3 = None
+    for ln, leaf in matches:
+        if ln["u3"] != last_u3:
+            header = snap["hunks"][ln["u3"] - 1][0]["c"]
+            print(f"  [{ln['u3']}] {header}")
+            last_u3 = ln["u3"]
+        idx_str = f"[{ln['u3']}.{ln['u0']}.{ln['li']}]"
+        mark = "✓" if marks.get(id(leaf)) else " "
+        print(f"    {idx_str:12}{mark} {ln['c'][:80]}")
+
+
+def renumber_file(filepath: str, view: str = "outline", find_pattern: str | None = None):
+    """Establish a fresh numbering frame from the current diff."""
+    u3_hunks, _file_header = build_hierarchy(filepath)
     if not u3_hunks:
-        # Also drop any stale stored numbering
         try:
             os.remove(snapshot_path(filepath))
         except OSError:
             pass
         print(f"No changes in {filepath}")
         return
-
-    print(f"Changes in {filepath}:")
-    print()
-
-    for hunk in u3_hunks:
-        for diff_line in hunk:
-            if diff_line.line_type == "@@":
-                print("━" * 60)
-                print(f"[{diff_line.u3_idx}] {diff_line.content}")
-                print("━" * 60)
-            elif diff_line.line_type in ("+", "-"):
-                idx_str = f"[{diff_line.u3_idx}.{diff_line.u0_idx}.{diff_line.line_idx}]"
-                print(f"{idx_str:12} {diff_line.content}")
-            else:
-                print(f"{'':12} {diff_line.content}")
+    snap = save_snapshot(filepath, u3_hunks)
+    n_leaves = len(snap["leaves"])
+    print(f"Renumbered {filepath}: {len(snap['hunks'])} hunk(s), "
+          f"{n_leaves} change line(s).")
+    if view == "print":
         print()
-
-    print("Selectors: N (hunk) | N.M (sub-hunk) | N.M.L (line) | N.{1..3} (range)")
-    save_snapshot(filepath, u3_hunks)
-    print("IDs stored: they stay valid until the next --print, even across stagings.")
+        print_full(filepath)
+    elif view == "find" and find_pattern is not None:
+        print()
+        print_find(filepath, find_pattern)
+    else:
+        print_outline(filepath)
 
 
 def repo_overview():
@@ -420,12 +557,12 @@ def resolve_selectors(snap: dict, selectors: list[str], all_except: bool) -> lis
         selections.extend(items)
 
     if dead:
-        print("Error: selectors that match nothing in the numbering of the "
-              "last --print:")
+        print("Error: selectors that match nothing in the stored numbering:")
         for sel, missing in dead:
             ids = ", ".join(selector_id(m) for m in missing)
             print(f"  '{sel}' -> no such ID: {ids}")
-        print("Nothing was done. Re-run --print to see current changes.")
+        print("Nothing was done. Use --print to see the stored numbering, "
+              "or --renumber if the changes have moved on.")
         sys.exit(1)
 
     def selected(leaf):
@@ -516,9 +653,9 @@ def print_remaining(filepath: str, snap: dict):
     assignment = assign_snapshot_to_current(snap, u3_hunks)
     remaining = [leaf for leaf, dl in zip(snap["leaves"], assignment) if dl is not None]
     if not remaining:
-        print(f"All changes from the last --print of {filepath} are staged.")
+        print(f"All changes in the stored numbering of {filepath} are staged.")
         return
-    print(f"Remaining unstaged in {filepath} (IDs from your last --print):")
+    print(f"Remaining unstaged in {filepath} (stored numbering):")
     by_u3 = {}
     for leaf in remaining:
         by_u3.setdefault(leaf["id"][0], []).append(leaf)
@@ -609,11 +746,12 @@ def unstage_selections(filepath: str, selectors: list[str], dry_run: bool = Fals
     """
     snap = load_snapshot(filepath)
     if snap is None:
-        print(f"Error: no stored numbering for {filepath}; run --print first.")
+        print(f"Error: no stored numbering for {filepath}; run --renumber first.")
         sys.exit(1)
     if snap["worktree_sha"] != worktree_sha(filepath):
-        print(f"Error: {filepath} was modified since the last --print; "
-              f"re-run --print (unstage needs a trustworthy numbering).")
+        print(f"Error: {filepath} was modified since its numbering was "
+              f"established; run --renumber (unstage needs a trustworthy "
+              f"numbering).")
         sys.exit(1)
     if snap.get("prestaged"):
         print("Error: the file already had staged changes when --print ran; "
@@ -692,21 +830,27 @@ def unstage_selections(filepath: str, selectors: list[str], dry_run: bool = Fals
 USAGE = """\
 Usage: stage-hunks.py [<file>] [selectors...] [flags]
 
-Examples:
-  stage-hunks.py --print                # Overview of all changed files
-  stage-hunks.py src/foo.py --print     # List changes, store the numbering
-  stage-hunks.py src/foo.py --all       # Stage all changes
-  stage-hunks.py src/foo.py 2           # Stage U3 hunk 2
-  stage-hunks.py src/foo.py 2.1         # Stage U0 sub-hunk 2.1
-  stage-hunks.py src/foo.py 2.1.3       # Stage line 3 of sub-hunk 2.1
-  stage-hunks.py src/foo.py '2.{1..3}'  # Stage sub-hunks 2.1, 2.2, 2.3
-  stage-hunks.py src/foo.py 1 3.2 5.1.1 # Mixed selectors
-  stage-hunks.py src/foo.py --all-except 3 5.2   # Everything but 3 and 5.2
-  stage-hunks.py src/foo.py --unstage 3          # Reverse hunk 3 from the index
-  stage-hunks.py src/foo.py 2 --dry-run          # Show the patch, change nothing
+Establish numbering (the only operation that renumbers):
+  stage-hunks.py src/foo.py --renumber   # New frame + ack + outline
+  stage-hunks.py src/foo.py --renumber --print        # ... + full listing
+  stage-hunks.py src/foo.py --renumber --find <re>    # ... + content search
 
-IDs always refer to the numbering of the LAST --print of the file; staging
-never renumbers. Editing the file invalidates the stored numbering."""
+Read views (never renumber; render the stored frame with staged marks):
+  stage-hunks.py --print                 # Overview of all changed files
+  stage-hunks.py src/foo.py --print      # Full listing
+  stage-hunks.py src/foo.py --print 2 5  # Only hunks 2 and 5
+  stage-hunks.py src/foo.py --outline    # One line per hunk
+  stage-hunks.py src/foo.py --find <re>  # Changed lines matching a regex
+
+Stage / unstage (addressed in the stored numbering):
+  stage-hunks.py src/foo.py 2 3.1 5.1.{1..3}
+  stage-hunks.py src/foo.py --all
+  stage-hunks.py src/foo.py --all-except 3 5.2
+  stage-hunks.py src/foo.py --unstage 3
+  stage-hunks.py src/foo.py 2 --dry-run  # Show the patch, change nothing
+
+IDs always refer to the stored numbering (established by the first contact
+with a file, or explicitly by --renumber). Editing the file invalidates it."""
 
 
 def main():
@@ -715,31 +859,64 @@ def main():
         print(USAGE)
         sys.exit(1)
 
-    dry_run = "--dry-run" in args
-    unstage = "--unstage" in args
-    all_except = "--all-except" in args
-    args = [a for a in args if a not in ("--dry-run", "--unstage", "--all-except")]
+    def take_flag(name):
+        if name in args:
+            args.remove(name)
+            return True
+        return False
 
-    if args == ["--print"] or args == ["-p"]:
-        repo_overview()
-        return
+    dry_run = take_flag("--dry-run")
+    unstage = take_flag("--unstage")
+    all_except = take_flag("--all-except")
+    renumber = take_flag("--renumber")
+    outline = take_flag("--outline")
+    do_print = take_flag("--print") or take_flag("-p")
+
+    find_pattern = None
+    if "--find" in args:
+        i = args.index("--find")
+        if i + 1 >= len(args):
+            print("Error: --find requires a regex argument")
+            sys.exit(1)
+        find_pattern = args[i + 1]
+        del args[i:i + 2]
 
     if not args:
+        if do_print:
+            repo_overview()
+            return
         print(USAGE)
         sys.exit(1)
 
     filepath = args[0]
     selectors = args[1:]
 
-    if not selectors or selectors == ["--print"] or selectors == ["-p"]:
-        display_hunks(filepath)
+    if renumber:
+        view = "print" if do_print else ("find" if find_pattern else "outline")
+        renumber_file(filepath, view=view, find_pattern=find_pattern)
+    elif find_pattern is not None:
+        print_find(filepath, find_pattern)
+    elif outline:
+        print_outline(filepath)
+    elif do_print:
+        print_full(filepath, selectors or None)
     elif unstage:
         unstage_selections(filepath, selectors, dry_run=dry_run)
     elif all_except:
         stage_selections(filepath, selectors, all_except=True, dry_run=dry_run)
-    else:
+    elif selectors:
         stage_selections(filepath, selectors, dry_run=dry_run)
+    else:
+        # Bare file argument: show the stored frame
+        print_full(filepath)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # Output was piped into something that stopped reading (head, grep -m);
+        # exit quietly instead of dumping a traceback
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(0)
