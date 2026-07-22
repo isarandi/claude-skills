@@ -1,0 +1,36 @@
+# Block everything at the top level; only explicitly allowed entries are tracked
+/*
+
+# Allowed: the two versioned skills
+!/.gitignore
+!/skills/
+/skills/*
+!/skills/git-staging/
+!/skills/search-history/
+
+# Never include these, under any circumstances - listed explicitly as a
+# second layer of defense even though the top-level block already covers
+# them (credentials, conversation transcripts, histories, session state)
+/.credentials.json
+/settings.json
+/settings.local.json
+/projects/
+/history.db*
+/history-index*
+/history.jsonl
+/sessions/
+/session-env/
+/shell-snapshots/
+/file-history/
+/todos/
+/paste-cache/
+/plans/
+/debug/
+/statsig/
+/telemetry/
+/cache/
+/stats-cache.json
+
+# Hygiene inside the allowed trees
+__pycache__/
+*.pyc
