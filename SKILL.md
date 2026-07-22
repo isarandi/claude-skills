@@ -14,15 +14,40 @@ Stage specific changes with 3-level granularity: U3 hunk > U0 sub-hunk > individ
 ## Quick Start
 
 ```bash
-# List all changes with IDs
-~/.claude/skills/git-staging/stage-hunks.py src/file.py --print
+# Overview of all changed files
+~/.claude/skills/git-staging/stage-hunks.py --print
 
-# Stage all changes
-~/.claude/skills/git-staging/stage-hunks.py src/file.py --all
+# List one file's changes with IDs (stores the numbering)
+~/.claude/skills/git-staging/stage-hunks.py src/file.py --print
 
 # Stage by selector
 ~/.claude/skills/git-staging/stage-hunks.py src/file.py 2.1.3
+
+# Stage everything / everything except some IDs
+~/.claude/skills/git-staging/stage-hunks.py src/file.py --all
+~/.claude/skills/git-staging/stage-hunks.py src/file.py --all-except 3 5.2
+
+# Undo a staging by the same IDs
+~/.claude/skills/git-staging/stage-hunks.py src/file.py --unstage 3
+
+# Preview without touching the index
+~/.claude/skills/git-staging/stage-hunks.py src/file.py 2 --dry-run
 ```
+
+## Persistent IDs
+
+Every `--print` of a file **stores its numbering** (in `.git/stage-hunks/`).
+Selectors always refer to the numbering of the **last `--print`** of that
+file — staging never renumbers anything, so you can print once and stage
+many commits' worth of hunks from the same listing, even with `git commit`
+runs in between. Only two things establish a new frame of reference:
+
+- a new `--print` of the file, or
+- editing the file, which invalidates the stored numbering (the tool then
+  refuses selectors until you re-print).
+
+Re-staging an already-staged ID is an error, stale IDs are an error, and
+nothing is ever staged partially on a failed call.
 
 ## Display Format
 
@@ -111,8 +136,8 @@ Selectors: N (hunk) | N.M (sub-hunk) | N.M.L (line) | N.{1..3} (range)
 
 $ ~/.claude/skills/git-staging/stage-hunks.py example.py 1.1.1 2.1
 Staged: +3/-0 lines across 2 hunk(s)
-Remaining unstaged in example.py (IDs renumbered):
-  [1] +    """Perform basic arithmetic operations."""
+Remaining unstaged in example.py (IDs from your last --print):
+  [1] +    """Perform basic arithmetic operations."""  (+4 more line(s))
   [2] +        self.history.clear()
 
 $ git diff --staged
@@ -139,7 +164,7 @@ diff --git a/example.py b/example.py
 # 1. View changes with IDs
 ~/.claude/skills/git-staging/stage-hunks.py src/file.py --print
 
-# 2. Stage specific changes
+# 2. Stage specific changes (repeatable with the same numbering)
 ~/.claude/skills/git-staging/stage-hunks.py src/file.py 1.1 2.3.{1..2}
 
 # 3. Verify
@@ -147,6 +172,9 @@ git diff --staged
 
 # 4. Commit
 git commit -m "message"
+
+# 5. Keep staging the next commit from the SAME numbering - no re-print needed
+~/.claude/skills/git-staging/stage-hunks.py src/file.py 3 4.1
 ```
 
 ## How It Works
@@ -163,16 +191,19 @@ git commit -m "message"
 
 ## Important
 
-- After staging some hunks from a file, the remaining unstaged hunks are
-  **renumbered**. Every successful staging prints the remaining hunks with
-  their fresh IDs; still re-run `--print` before composing sub-hunk or
-  line-level selectors from the same file.
-- Selectors are **validated**: any selector (or range element) that matches
-  no existing change aborts the whole operation with exit code 1 and stages
-  nothing — a stale ID from before a renumbering cannot be silently ignored.
-- The `Staged:` line reports what was actually staged (counted from the
-  applied patch), not an echo of your arguments. If the counts don't match
-  your intent, inspect with `git diff --staged` before committing.
+- Selectors are **validated against the stored numbering**: any selector
+  (or range element) that matches no printed ID aborts with exit code 1 and
+  stages nothing. Selecting only already-staged lines is an error too.
+- The `Staged:`/`Unstaged:` line reports what actually happened (counted
+  from the applied patch), not an echo of your arguments. If the counts
+  don't match your intent, inspect with `git diff --staged` before
+  committing.
+- `--unstage` handles changes staged since the last `--print` of a file
+  that had **nothing staged at print time**; with pre-existing staged
+  content (or after the staged lines were committed) it refuses and points
+  you to `git restore --staged`.
+- Identical deleted lines at the same position are interchangeable; the
+  tool treats them as a group, which is semantically equivalent.
 
 ## Limitations
 
