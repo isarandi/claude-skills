@@ -26,16 +26,18 @@ $S src/file.py --print 2 5      # Full detail of hunks 2 and 5 only
 $S src/file.py 2.1.3            # Stage line 3 of sub-hunk 2.1
 $S src/file.py --all            # Stage everything
 $S src/file.py --all-except 3 5.2
-$S src/file.py --unstage 3      # Undo, by the same IDs
 $S src/file.py 2 --dry-run      # Preview the patch, touch nothing
 ```
+
+The `--renumber`/`--outline` output is compact — physically one line per hunk —
+so it is safe to consume in full; no need to truncate or filter it.
 
 ## Persistent numbering
 
 **`--renumber` is the only operation that (re)numbers.** It stores the
 numbering (in `.git/stage-hunks/`), prints a short acknowledgment plus the
 outline (combine with `--print` or `--find` for a different first view).
-Everything else — `--print`, `--outline`, `--find`, staging, unstaging —
+Everything else — `--print`, `--outline`, `--find`, staging —
 renders and resolves in that stored frame and never renumbers, so one
 numbering serves a whole series of commits, including with `git commit`
 runs in between. `--print` marks already-staged lines with `✓`.
@@ -47,8 +49,11 @@ Two rules complete the picture:
 - Editing the file invalidates the stored numbering (content hash check);
   every operation then refuses until you run `--renumber`.
 
-Re-staging an already-staged ID is an error, stale IDs are an error, and
-nothing is ever staged partially on a failed call.
+A selection that includes already-staged (or committed) lines stages only
+what remains and reports the skipped count; it is an error only when nothing
+in the selection is left to stage. So after committing part of a hunk (e.g.
+line `2.1.1`), selecting `2` later stages just the rest of it. Stale IDs are
+an error, and nothing is ever staged partially on a failed call.
 
 ## Typical agent workflow
 
@@ -204,15 +209,15 @@ git commit -m "message"
 
 - Selectors are **validated against the stored numbering**: any selector
   (or range element) that matches no printed ID aborts with exit code 1 and
-  stages nothing. Selecting only already-staged lines is an error too.
-- The `Staged:`/`Unstaged:` line reports what actually happened (counted
+  stages nothing. A selection consisting entirely of already-staged lines is
+  an error too (partially staged selections stage the remainder, see above).
+- The `Staged:` line reports what actually happened (counted
   from the applied patch), not an echo of your arguments. If the counts
   don't match your intent, inspect with `git diff --staged` before
   committing.
-- `--unstage` handles changes staged since the last `--print` of a file
-  that had **nothing staged at print time**; with pre-existing staged
-  content (or after the staged lines were committed) it refuses and points
-  you to `git restore --staged`.
+- There is no unstage operation. To undo staging, use
+  `git restore --staged <file>` (coarse, per file) — the stored numbering
+  stays valid and the same IDs can be staged again afterwards.
 - Identical deleted lines at the same position are interchangeable; the
   tool treats them as a group, which is semantically equivalent.
 

@@ -63,16 +63,15 @@ def parse_hunk_header(line: str) -> tuple[int, int, int, int, str] | None:
     return old_start, old_len, new_start, new_len, context
 
 
-def build_hierarchy(filepath: str, cached: bool = False) -> tuple[list[list[DiffLine]], str]:
+def build_hierarchy(filepath: str) -> tuple[list[list[DiffLine]], str]:
     """Build 3-level hierarchy by comparing U3 and U0 diffs.
 
     Returns:
         - List of U3 hunks, each containing DiffLine objects with hierarchy IDs
         - File header string
     """
-    extra = ["--cached"] if cached else []
-    u3_diff = run_git(["diff", "-U3", *extra, "--", filepath])
-    u0_diff = run_git(["diff", "-U0", *extra, "--", filepath])
+    u3_diff = run_git(["diff", "-U3", "--", filepath])
+    u0_diff = run_git(["diff", "-U0", "--", filepath])
 
     if not u3_diff.strip():
         return [], ""
@@ -255,12 +254,10 @@ def worktree_sha(filepath: str) -> str:
 
 
 def save_snapshot(filepath: str, u3_hunks: list) -> dict:
-    prestaged = bool(run_git(["diff", "--cached", "--name-only", "--", filepath]).strip())
     snap = {
         "version": 2,
         "file": filepath,
         "worktree_sha": worktree_sha(filepath),
-        "prestaged": prestaged,
         # Full listing (including context) so read views can render the
         # stored frame even after parts of it were staged away
         "hunks": [
@@ -579,15 +576,11 @@ def leaf_id_str(leaf: dict) -> str:
 # ── Patch building ───────────────────────────────────────────────────
 
 
-def build_patch(u3_hunks: list, file_header: str, selected_lines: set,
-                mode: str = "stage") -> str:
+def build_patch(u3_hunks: list, file_header: str, selected_lines: set) -> str:
     """Build a patch containing only the selected change lines.
 
-    mode='stage' (applied forward to the index):
-        unselected '+' lines are dropped, unselected '-' become context.
-    mode='unstage' (applied in reverse to the index, on the cached diff):
-        unselected '-' lines are dropped (absent from the index either way),
-        unselected '+' become context (present in the index and staying).
+    Applied forward to the index: unselected '+' lines are dropped,
+    unselected '-' become context.
     """
     patch_lines = [file_header]
 
@@ -612,20 +605,15 @@ def build_patch(u3_hunks: list, file_header: str, selected_lines: set,
                 if id(diff_line) in selected_lines:
                     hunk_content.append(diff_line.content)
                     new_count += 1
-                elif mode == "unstage":
-                    hunk_content.append(" " + diff_line.content[1:])
-                    old_count += 1
-                    new_count += 1
-                # stage mode: drop the line entirely
+                # unselected '+': drop the line entirely
             elif diff_line.line_type == "-":
                 if id(diff_line) in selected_lines:
                     hunk_content.append(diff_line.content)
                     old_count += 1
-                elif mode == "stage":
+                else:
                     hunk_content.append(" " + diff_line.content[1:])
                     old_count += 1
                     new_count += 1
-                # unstage mode: drop the line entirely
 
         if header_line:
             parsed = parse_hunk_header(header_line)
@@ -704,7 +692,7 @@ def stage_selections(filepath: str, selectors: list[str], all_except: bool = Fal
         sys.exit(1)
 
     selected_lines = {id(dl) for dl in stageable}
-    patch = build_patch(u3_hunks, file_header, selected_lines, mode="stage")
+    patch = build_patch(u3_hunks, file_header, selected_lines)
 
     plus, minus, n_hunks = patch_counts(patch)
     if dry_run:
@@ -734,96 +722,6 @@ def stage_selections(filepath: str, selectors: list[str], all_except: bool = Fal
     print_remaining(filepath, snap)
 
 
-# ── Unstaging ────────────────────────────────────────────────────────
-
-
-def unstage_selections(filepath: str, selectors: list[str], dry_run: bool = False):
-    """Reverse-apply selected changes from the index, by last-printed IDs.
-
-    Only supports changes staged since the last --print of a file that had
-    nothing staged at print time: with pre-existing staged content, lines in
-    the cached diff cannot be attributed to printed IDs unambiguously.
-    """
-    snap = load_snapshot(filepath)
-    if snap is None:
-        print(f"Error: no stored numbering for {filepath}; run --renumber first.")
-        sys.exit(1)
-    if snap["worktree_sha"] != worktree_sha(filepath):
-        print(f"Error: {filepath} was modified since its numbering was "
-              f"established; run --renumber (unstage needs a trustworthy "
-              f"numbering).")
-        sys.exit(1)
-    if snap.get("prestaged"):
-        print("Error: the file already had staged changes when --print ran; "
-              "IDs cannot be matched against the index unambiguously. "
-              "Use git restore --staged for coarse unstaging.")
-        sys.exit(1)
-
-    if "--all" in selectors or "-a" in selectors:
-        chosen = list(snap["leaves"])
-    else:
-        chosen = resolve_selectors(snap, selectors, all_except=False)
-
-    # Anything still assigned to the unstaged diff is not staged
-    unstaged_hunks, _ = build_hierarchy(filepath)
-    assignment = assign_snapshot_to_current(snap, unstaged_hunks)
-    assigned = {id(leaf): dl for leaf, dl in zip(snap["leaves"], assignment)}
-    targets = [leaf for leaf in chosen if assigned.get(id(leaf)) is None]
-    skipped = [leaf for leaf in chosen if assigned.get(id(leaf)) is not None]
-
-    if not targets:
-        print("Error: none of the selected lines are currently staged.")
-        sys.exit(1)
-
-    # The cached diff consists exactly of snapshot lines staged since the
-    # print (prestaged was empty), in file order - match them one to one.
-    cached_hunks, cached_header = build_hierarchy(filepath, cached=True)
-    cached_leaves = list(iter_leaves(cached_hunks))
-    staged_snap = [leaf for leaf in snap["leaves"] if assigned.get(id(leaf)) is None]
-    if len(cached_leaves) != len(staged_snap) or any(
-        c.line_type != s["key"][0] or c.content != s["key"][2]
-        for c, s in zip(cached_leaves, staged_snap)
-    ):
-        print("Error: the index changed outside this tool (or a commit was "
-              "made); cannot match IDs against the staged content. "
-              "Use git restore --staged for coarse unstaging.")
-        sys.exit(1)
-
-    target_ids = {id(leaf) for leaf in targets}
-    selected_lines = {
-        id(c) for c, s in zip(cached_leaves, staged_snap) if id(s) in target_ids
-    }
-
-    patch = build_patch(cached_hunks, cached_header, selected_lines, mode="unstage")
-    plus, minus, n_hunks = patch_counts(patch)
-
-    if dry_run:
-        print(f"Would unstage: +{plus}/-{minus} lines across {n_hunks} hunk(s)")
-        if skipped:
-            print(f"({len(skipped)} selected line(s) are not staged)")
-        print()
-        print(patch, end="")
-        return
-
-    proc = subprocess.run(
-        ["git", "apply", "--cached", "--reverse", "-v"],
-        input=patch,
-        text=True,
-        capture_output=True,
-    )
-    if proc.returncode != 0:
-        print("Failed to reverse-apply patch:")
-        print(proc.stderr)
-        print("\nPatch was:")
-        print(patch)
-        sys.exit(1)
-
-    print(f"Unstaged: +{plus}/-{minus} lines across {n_hunks} hunk(s)")
-    if skipped:
-        print(f"({len(skipped)} selected line(s) were not staged to begin with)")
-    print_remaining(filepath, snap)
-
-
 # ── Entry point ──────────────────────────────────────────────────────
 
 
@@ -842,12 +740,14 @@ Read views (never renumber; render the stored frame with staged marks):
   stage-hunks.py src/foo.py --outline    # One line per hunk
   stage-hunks.py src/foo.py --find <re>  # Changed lines matching a regex
 
-Stage / unstage (addressed in the stored numbering):
+Stage (addressed in the stored numbering):
   stage-hunks.py src/foo.py 2 3.1 5.1.{1..3}
   stage-hunks.py src/foo.py --all
   stage-hunks.py src/foo.py --all-except 3 5.2
-  stage-hunks.py src/foo.py --unstage 3
   stage-hunks.py src/foo.py 2 --dry-run  # Show the patch, change nothing
+
+To undo staging, use git restore --staged <file>; the stored numbering stays
+valid and the same IDs can be staged again.
 
 IDs always refer to the stored numbering (established by the first contact
 with a file, or explicitly by --renumber). Editing the file invalidates it."""
@@ -866,7 +766,6 @@ def main():
         return False
 
     dry_run = take_flag("--dry-run")
-    unstage = take_flag("--unstage")
     all_except = take_flag("--all-except")
     renumber = take_flag("--renumber")
     outline = take_flag("--outline")
@@ -900,8 +799,6 @@ def main():
         print_outline(filepath)
     elif do_print:
         print_full(filepath, selectors or None)
-    elif unstage:
-        unstage_selections(filepath, selectors, dry_run=dry_run)
     elif all_except:
         stage_selections(filepath, selectors, all_except=True, dry_run=dry_run)
     elif selectors:
