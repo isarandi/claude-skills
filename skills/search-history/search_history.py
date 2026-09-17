@@ -1220,7 +1220,8 @@ def resolve_session_files(args, project_dir):
 
 def get_agent_files(project_dir, session_id=None, agent_filter=None):
     """Get agent files, optionally filtered by session or agent ID prefix."""
-    agent_files = list(project_dir.glob("agent-*.jsonl"))
+    # Old layout: <project>/agent-*.jsonl ; newer Claude Code: <project>/<session>/subagents/agent-*.jsonl
+    agent_files = list(project_dir.glob("agent-*.jsonl")) + list(project_dir.glob("*/subagents/agent-*.jsonl"))
 
     if agent_filter:
         # Filter by agent ID prefix
@@ -1428,12 +1429,36 @@ def expand_record(rec, records=None, agent_id=None):
             tool_use_id = block.get("tool_use_id", "")
             result_content = block.get("content", "")
             if isinstance(result_content, list):
-                result_content = "\n".join(str(x.get("text", x)) for x in result_content)
+                result_content = "\n".join(_tool_result_item_text(x) for x in result_content)
             # Try to find the tool name from the matching tool_use
             tool_name = None
             if records:
                 tool_name = _find_tool_name_for_result(records, tool_use_id)
             yield make_result(make_type("tool_output"), str(result_content), tool_name, tool_use_id=tool_use_id)
+
+
+def _tool_result_item_text(item):
+    """Text for one item of a tool_result content list.
+
+    Images (e.g. from Read on a PNG/JPEG) arrive as base64 blobs of hundreds of KB.
+    Indexing them bloats the FTS index by orders of magnitude and is never searchable
+    in a useful way, so they are replaced by a short placeholder.
+    """
+    if not isinstance(item, dict):
+        return str(item)
+    itype = item.get("type")
+    if itype == "text":
+        return str(item.get("text", ""))
+    if itype == "image":
+        src = item.get("source") or {}
+        data = src.get("data") or ""
+        media = src.get("media_type") or src.get("type") or "image"
+        return f"[image {media} {len(data) * 3 // 4 // 1024} KB]"
+    if "text" in item:
+        return str(item["text"])
+    # Unknown block: keep it searchable but never let a blob through
+    text = str(item)
+    return text if len(text) <= 4000 else text[:4000] + f" ...[{len(text)} chars truncated]"
 
 
 def _find_tool_name_for_result(records, tool_use_id):
