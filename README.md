@@ -22,7 +22,7 @@ ln -s ~/projects/claude-skills/skills/search-history ~/.claude/skills/search-his
 
 A `git pull` in the clone then updates both skills. Claude Code finds new skills when a session starts.
 
-There is another option. The `.gitignore` at the root ignores everything except itself, this README, `skills/git-staging/` and `skills/search-history/`. As a second safeguard it also lists the credential, settings and transcript files of `~/.claude` by name. With this design the repository can be checked out directly as `~/.claude`, and nothing else in that directory is ever tracked.
+There is another option. The `.gitignore` at the root ignores everything except itself, this README, the license, `skills/git-staging/` and `skills/search-history/`. As a second safeguard it also lists the credential, settings and transcript files of `~/.claude` by name. With this design the repository can be checked out directly as `~/.claude`, and nothing else in that directory is ever tracked.
 
 ### Requirements
 
@@ -107,3 +107,7 @@ skills/
     claude-history-indexer.service
     history_db.py, plot_activity.py  older utilities
 ```
+
+## License
+
+MIT; see [LICENSE](LICENSE).

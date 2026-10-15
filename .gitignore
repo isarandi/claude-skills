@@ -1,9 +1,10 @@
 # Block everything at the top level; only explicitly allowed entries are tracked
 /*
 
-# Allowed: this file, the README and the two versioned skills
+# Allowed: this file, the README, the license and the two versioned skills
 !/.gitignore
 !/README.md
+!/LICENSE
 !/skills/
 /skills/*
 !/skills/git-staging/
