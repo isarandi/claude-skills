@@ -1220,7 +1220,8 @@ def resolve_session_files(args, project_dir):
 
 def get_agent_files(project_dir, session_id=None, agent_filter=None):
     """Get agent files, optionally filtered by session or agent ID prefix."""
-    agent_files = list(project_dir.glob("agent-*.jsonl"))
+    # Older Claude Code versions kept agent files next to the sessions, newer ones in <session>/subagents/
+    agent_files = list(project_dir.glob("agent-*.jsonl")) + list(project_dir.glob("*/subagents/agent-*.jsonl"))
 
     if agent_filter:
         # Filter by agent ID prefix

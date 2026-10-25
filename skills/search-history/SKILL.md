@@ -175,7 +175,7 @@ search_history.py -c --last 20
 
 ## Searching Agents
 
-When Claude spawns subagents (via Task tool), their conversations are stored in separate `agent-*.jsonl` files. Use `agent_` prefixed types to search inside agents:
+When Claude spawns subagents (via Task tool), their conversations are stored in separate `agent-*.jsonl` files (in `<session>/subagents/` in current Claude Code versions). Use `agent_` prefixed types to search inside agents:
 
 ```bash
 # Search agent conversations

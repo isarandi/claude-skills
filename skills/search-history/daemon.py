@@ -155,6 +155,31 @@ class HistoryIndexer:
 
         self.db.commit()
 
+    def watch(self, path, mask):
+        """Add an inotify watch, unless the directory vanished meanwhile."""
+        try:
+            wd = self.inotify.add_watch(path, mask)
+        except OSError:
+            return
+        self.watch_to_path[wd] = path
+
+    def watch_project_dir(self, project_dir):
+        """Watch a project directory and the subagents/ folders of its sessions."""
+        self.watch(project_dir, flags.MODIFY | flags.CREATE | flags.MOVED_TO)
+        try:
+            session_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
+        except OSError:
+            return
+        for session_dir in session_dirs:
+            self.watch_session_dir(session_dir)
+
+    def watch_session_dir(self, session_dir):
+        """Watch a session directory for its subagents/ folder, and that folder for agent transcripts."""
+        self.watch(session_dir, flags.CREATE | flags.MOVED_TO)
+        subagents_dir = session_dir / "subagents"
+        if subagents_dir.is_dir():
+            self.watch(subagents_dir, flags.MODIFY | flags.CREATE | flags.MOVED_TO)
+
     def setup_watches(self):
         """Set up inotify watches on all relevant directories."""
         self.inotify = INotify()
@@ -168,8 +193,7 @@ class HistoryIndexer:
             # Watch each project directory
             for project_dir in PROJECTS_DIR.iterdir():
                 if project_dir.is_dir():
-                    wd = self.inotify.add_watch(project_dir, watch_flags)
-                    self.watch_to_path[wd] = project_dir
+                    self.watch_project_dir(project_dir)
 
         # Watch plans directory
         if PLANS_DIR.exists():
@@ -201,8 +225,7 @@ class HistoryIndexer:
         if PROJECTS_DIR.exists():
             for project_dir in PROJECTS_DIR.iterdir():
                 if project_dir.is_dir():
-                    for jsonl_file in project_dir.glob("*.jsonl"):
-                        self.index_jsonl_incremental(jsonl_file)
+                    self.sync_project(project_dir)
 
         # Index all plan files
         if PLANS_DIR.exists():
@@ -228,6 +251,15 @@ class HistoryIndexer:
                         self.index_snapshot(snapshot_file)
 
         self.db.commit()
+
+    def sync_project(self, project_dir):
+        """Index a project's session transcripts and their subagent transcripts."""
+        for jsonl_file in project_dir.glob("*.jsonl"):
+            self.index_jsonl_incremental(jsonl_file)
+        # Older Claude Code versions kept agent-*.jsonl next to the sessions (matched
+        # above); newer ones keep them in <session>/subagents/
+        for jsonl_file in project_dir.glob("*/subagents/*.jsonl"):
+            self.index_jsonl_incremental(jsonl_file)
 
     def get_indexed_info(self, file_path):
         """Get indexing progress for a file."""
@@ -261,7 +293,10 @@ class HistoryIndexer:
             return
 
         # Determine project and session from path
-        project_name = file_path.parent.name
+        if file_path.parent.name == "subagents":
+            project_name = file_path.parents[2].name  # <project>/<session>/subagents/agent-*.jsonl
+        else:
+            project_name = file_path.parent.name
         session_id = file_path.stem
         is_agent = 'agent-' in file_path.name
         agent_id = session_id.replace('agent-', '') if is_agent else None
@@ -430,15 +465,27 @@ class HistoryIndexer:
 
         full_path = path / name
 
-        # New project directory
+        # New project directory. One moved in whole brings files that raise no
+        # events of their own, so index what it already holds.
         if path == PROJECTS_DIR and event.mask & (flags.CREATE | flags.MOVED_TO):
             if full_path.is_dir():
-                try:
-                    wd = self.inotify.add_watch(full_path, flags.MODIFY | flags.CREATE | flags.MOVED_TO)
-                    self.watch_to_path[wd] = full_path
-                    print(f"Added watch for new project: {name}", file=sys.stderr)
-                except OSError:
-                    pass
+                self.watch_project_dir(full_path)
+                print(f"Added watch for new project: {name}", file=sys.stderr)
+                self.sync_project(full_path)
+            return
+
+        # New session directory in a project, or a subagents/ folder in a session directory
+        if event.mask & (flags.CREATE | flags.MOVED_TO) and full_path.is_dir():
+            if path.parent == PROJECTS_DIR:
+                self.watch_session_dir(full_path)
+                found = full_path.glob("subagents/*.jsonl")
+            elif path.parent.parent == PROJECTS_DIR and name == "subagents":
+                self.watch(full_path, flags.MODIFY | flags.CREATE | flags.MOVED_TO)
+                found = full_path.glob("*.jsonl")
+            else:
+                return
+            for jsonl_file in found:
+                self.index_jsonl_incremental(jsonl_file)
             return
 
         # New file-history session directory
