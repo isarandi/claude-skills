@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["inotify_simple"]
+# dependencies = ["inotify_simple; sys_platform == 'linux'"]
 # ///
 """
 Claude Code History Indexer Daemon
 
 Watches ~/.claude directories for changes and indexes content into SQLite for fast search.
-Uses inotify for real-time updates and FTS5 for full-text search.
+Uses inotify for real-time updates on Linux, polling elsewhere (macOS), and FTS5 for full-text search.
 """
 import json
 import os
@@ -17,11 +17,17 @@ import sys
 import time
 from pathlib import Path
 
-try:
-    from inotify_simple import INotify, flags
-except ImportError:
-    print("Error: inotify_simple not installed. Run: pip install inotify_simple", file=sys.stderr)
-    sys.exit(1)
+if sys.platform == "linux":
+    try:
+        from inotify_simple import INotify, flags
+    except ImportError:
+        print("Error: inotify_simple not installed. Run: pip install inotify_simple", file=sys.stderr)
+        sys.exit(1)
+else:
+    INotify = None  # No inotify: run() polls instead
+
+# Seconds between rescans when polling
+POLL_INTERVAL = 5
 
 # Paths
 CLAUDE_DIR = Path.home() / ".claude"
@@ -42,6 +48,7 @@ class HistoryIndexer:
         self.db = None
         self.inotify = None
         self.watch_to_path = {}  # wd -> path
+        self.dir_mtimes = {}  # snapshot dir -> mtime at last listing
         self.running = True
 
     def init_db(self):
@@ -185,7 +192,11 @@ class HistoryIndexer:
     def initial_sync(self):
         """Index any files that haven't been indexed yet."""
         print("Starting initial sync...", file=sys.stderr)
+        self.sync_all()
+        print("Initial sync complete", file=sys.stderr)
 
+    def sync_all(self):
+        """Index new and changed files. Unchanged ones are skipped by mtime."""
         # Index all JSONL files
         if PROJECTS_DIR.exists():
             for project_dir in PROJECTS_DIR.iterdir():
@@ -201,13 +212,22 @@ class HistoryIndexer:
         # Index all snapshots
         if FILE_HISTORY_DIR.exists():
             for session_dir in FILE_HISTORY_DIR.iterdir():
-                if session_dir.is_dir():
-                    for snapshot_file in session_dir.iterdir():
-                        if snapshot_file.is_file() and '@v' in snapshot_file.name:
-                            self.index_snapshot(snapshot_file)
+                if not session_dir.is_dir():
+                    continue
+                # Snapshots are only ever added, which changes the directory's mtime.
+                # Read it before listing so a file added meanwhile is seen next time.
+                try:
+                    mtime = session_dir.stat().st_mtime
+                except OSError:
+                    continue
+                if self.dir_mtimes.get(session_dir) == mtime:
+                    continue
+                self.dir_mtimes[session_dir] = mtime
+                for snapshot_file in session_dir.iterdir():
+                    if snapshot_file.is_file() and '@v' in snapshot_file.name:
+                        self.index_snapshot(snapshot_file)
 
         self.db.commit()
-        print("Initial sync complete", file=sys.stderr)
 
     def get_indexed_info(self, file_path):
         """Get indexing progress for a file."""
@@ -450,6 +470,12 @@ class HistoryIndexer:
     def run(self):
         """Main event loop."""
         self.init_db()
+        if INotify is None:
+            self.initial_sync()
+            self.poll_loop()
+            self.cleanup()
+            return
+
         self.setup_watches()
         self.initial_sync()
 
@@ -468,6 +494,17 @@ class HistoryIndexer:
                 time.sleep(1)
 
         self.cleanup()
+
+    def poll_loop(self):
+        """Rescan every POLL_INTERVAL seconds, for systems without inotify."""
+        print(f"Daemon running, polling every {POLL_INTERVAL}s...", file=sys.stderr)
+
+        while self.running:
+            time.sleep(POLL_INTERVAL)
+            try:
+                self.sync_all()
+            except Exception as e:
+                print(f"Error in poll loop: {e}", file=sys.stderr)
 
     def cleanup(self):
         """Clean up resources."""

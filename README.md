@@ -27,20 +27,21 @@ There is another option. The `.gitignore` at the root ignores everything except 
 ### Requirements
 
 - `git-staging`: Python 3.10 or later and git. It uses only the standard library.
-- `search-history`: Python 3.10 or later, built against SQLite with FTS5 (standard in current distributions). The optional indexer daemon also needs Linux (it relies on inotify), a systemd user session, and [uv](https://docs.astral.sh/uv/) at `~/.local/bin/uv`. uv installs the daemon's one dependency, `inotify_simple`, by itself.
+- `search-history`: Python 3.10 or later, built against SQLite with FTS5 (standard in current distributions). The optional indexer daemon also needs [uv](https://docs.astral.sh/uv/), plus either Linux with a systemd user session (uv at `~/.local/bin/uv`) or macOS (uv anywhere on `PATH`, e.g. from Homebrew). On Linux, uv installs the daemon's one dependency, `inotify_simple`, by itself; on macOS the daemon needs nothing beyond the standard library.
 
 ### The search-history indexer
 
 `search_history.py` works without any setup. It reads the JSONL transcripts under `~/.claude/projects/` directly. The daemon keeps a full-text index of those transcripts, of the plans in `~/.claude/plans/` and of the file snapshots in `~/.claude/file-history/`. The index lives in an SQLite database at `~/.local/share/claude-history-index/history.db`. It is placed outside `~/.claude` so that writing to it does not wake Claude Code's own file watchers. When the database exists, searches use it.
 
-To install the daemon as a systemd user service:
+To install the daemon as a systemd user service (Linux) or a launchd agent (macOS):
 
 ```bash
 ~/.claude/skills/search-history/install.sh
-systemctl --user status claude-history-indexer.service
+systemctl --user status claude-history-indexer.service       # Linux
+launchctl print gui/$(id -u)/local.claude-history-indexer    # macOS
 ```
 
-The unit runs the daemon at nice 19 and in the idle I/O class, limited to 256 MB of memory and 10 % of one CPU. It indexes the existing history on its first start and then follows changes as they happen.
+The daemon indexes the existing history on its first start and then follows changes. On Linux it uses inotify, so changes are indexed as they happen; the unit runs it at nice 19 and in the idle I/O class, limited to 256 MB of memory and 10 % of one CPU. macOS has no inotify, so there the daemon rescans every 5 seconds. A rescan only checks modification times and costs a few milliseconds when nothing changed. The launchd agent runs it as a background process at nice 19 with low-priority I/O, and logs to `~/Library/Logs/claude-history-indexer.log`.
 
 ## git-staging
 
@@ -101,9 +102,9 @@ skills/
   search-history/
     SKILL.md
     search_history.py                search front end; reads the index or the raw JSONL
-    daemon.py                        inotify-based indexer
+    daemon.py                        indexer (inotify on Linux, polling on macOS)
     schema.sql                       index schema (FTS5)
-    install.sh                       installs the systemd user unit
+    install.sh                       installs the systemd user unit or launchd agent
     claude-history-indexer.service
     history_db.py, plot_activity.py  older utilities
 ```
