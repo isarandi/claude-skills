@@ -15,6 +15,7 @@ import signal
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 if sys.platform == "linux":
@@ -37,9 +38,19 @@ FILE_HISTORY_DIR = CLAUDE_DIR / "file-history"
 # Put DB outside ~/.claude to avoid triggering Claude's own file watchers
 DB_PATH = Path.home() / ".local/share/claude-history-index/history.db"
 
-# Import expand_record from search_history.py
+# Import record parsing and time conversion from search_history.py
 sys.path.insert(0, str(Path(__file__).parent))
-from search_history import expand_record, utc_to_local
+from search_history import (INDEX_VERSION, TIME_FORMAT, expand_record, mtime_to_utc_time,
+                            utc_index_time, utc_to_local)
+
+
+def _local_to_utc_text(ts):
+    """Convert a local time string (TIME_FORMAT, this process's zone) to UTC; unparseable as is."""
+    try:
+        dt = datetime.strptime(ts, TIME_FORMAT)
+    except (TypeError, ValueError):
+        return ts
+    return dt.astimezone(timezone.utc).strftime(TIME_FORMAT)
 
 
 class HistoryIndexer:
@@ -154,6 +165,115 @@ class HistoryIndexer:
             pass
 
         self.db.commit()
+        self.migrate()
+
+    def migrate(self):
+        """Bring an index written by an older daemon up to INDEX_VERSION."""
+        version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        if version >= INDEX_VERSION:
+            return
+        has_data = self.db.execute("SELECT 1 FROM records LIMIT 1").fetchone() or \
+            self.db.execute("SELECT 1 FROM snapshots LIMIT 1").fetchone()
+        if has_data and version < 1:
+            print("Migrating index to version 1 (UTC timestamps)...", file=sys.stderr)
+            self.migrate_to_v1()
+        self.db.execute(f"PRAGMA user_version = {INDEX_VERSION}")
+        self.db.commit()
+        if has_data:
+            # Give back the disk space the migration's write-ahead log took
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def migrate_to_v1(self):
+        """Store timestamps in UTC instead of the daemon's local time, and drop
+        the copies indexed from "api-request-blob" records.
+
+        A version 0 daemon wrote timestamps in its process's local time zone,
+        which could change across restarts. Each timestamp is therefore derived
+        anew from its source: the transcript line at the record's byte offset,
+        or the plan or snapshot file's modification time. Records whose source
+        is gone are converted from whichever zone (UTC or the current local one)
+        the re-derived records show the old daemon used.
+        """
+        db = self.db
+        # Records without uuid come from api-request-blob lines (plans use the file name).
+        # They can amount to a fifth of the content: free their pages without
+        # overwriting them (secure_delete), which would write all of it to the log.
+        # Their records_fts entries stay; search does not query that index.
+        secure_delete = db.execute("PRAGMA secure_delete").fetchone()[0]
+        db.execute("PRAGMA secure_delete = 0")
+        db.execute("DELETE FROM records WHERE (uuid IS NULL OR uuid = '') AND record_type != 'plan'")
+        db.execute(f"PRAGMA secure_delete = {int(secure_delete)}")
+
+        updates, unresolved, n_updated = [], [], 0
+        votes = {"utc": 0, "local": 0}
+        for (source_file,) in db.execute(
+                "SELECT DISTINCT source_file FROM records WHERE record_type != 'plan'").fetchall():
+            rows = db.execute(
+                "SELECT id, uuid, timestamp, byte_offset FROM records WHERE source_file = ? "
+                "ORDER BY byte_offset", (source_file,)).fetchall()
+            try:
+                f = open(source_file, 'rb')
+            except (OSError, TypeError):
+                unresolved.extend((row['id'], row['timestamp']) for row in rows)
+                continue
+            with f:
+                offset, rec = None, None
+                for row in rows:
+                    if row['byte_offset'] != offset:
+                        offset = row['byte_offset']
+                        f.seek(offset)
+                        try:
+                            rec = json.loads(f.readline())
+                        except ValueError:
+                            rec = None
+                    if not isinstance(rec, dict) or (rec.get('uuid') or '')[:12] != row['uuid']:
+                        unresolved.append((row['id'], row['timestamp']))
+                        continue
+                    new = utc_index_time(rec.get('timestamp'))
+                    if not new:
+                        pass
+                    elif row['timestamp'] == new:
+                        votes["utc"] += 1
+                    elif row['timestamp'] == utc_to_local(rec.get('timestamp')):
+                        votes["local"] += 1
+                    if new != row['timestamp']:
+                        updates.append((new, row['id']))
+            db.executemany("UPDATE records SET timestamp = ? WHERE id = ?", updates)
+            n_updated += len(updates)
+            updates = []
+
+        # Plans: the timestamp was the file's modification time, kept in indexed_files
+        for row in db.execute("""
+                SELECT r.id, r.timestamp, i.file_mtime FROM records r
+                LEFT JOIN indexed_files i ON i.file_path = r.source_file
+                WHERE r.record_type = 'plan'""").fetchall():
+            if row['file_mtime'] is None:
+                unresolved.append((row['id'], row['timestamp']))
+            else:
+                updates.append((mtime_to_utc_time(row['file_mtime']), row['id']))
+
+        # Records that could not be re-derived
+        old_was_local = votes["local"] > votes["utc"]
+        if old_was_local:
+            updates.extend((_local_to_utc_text(ts), rid) for rid, ts in unresolved)
+        db.executemany("UPDATE records SET timestamp = ? WHERE id = ?", updates)
+        n_updated += len(updates)
+
+        # Snapshots: the timestamp was the backup file's modification time
+        snapshot_updates = []
+        for row in db.execute("SELECT id, backup_id, session_id, timestamp FROM snapshots").fetchall():
+            try:
+                new = mtime_to_utc_time(
+                    (FILE_HISTORY_DIR / row['session_id'] / row['backup_id']).stat().st_mtime)
+            except (OSError, TypeError):
+                new = _local_to_utc_text(row['timestamp']) if old_was_local else row['timestamp']
+            if new != row['timestamp']:
+                snapshot_updates.append((new, row['id']))
+        db.executemany("UPDATE snapshots SET timestamp = ? WHERE id = ?", snapshot_updates)
+
+        print(f"Migrated: {n_updated} record and {len(snapshot_updates)} snapshot timestamps "
+              f"changed; {len(unresolved)} records without readable source, old times taken as "
+              f"{'local' if old_was_local else 'UTC'}", file=sys.stderr)
 
     def watch(self, path, mask):
         """Add an inotify watch, unless the directory vanished meanwhile."""
@@ -331,7 +451,7 @@ class HistoryIndexer:
                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (
                                 vr.get('uuid'),
-                                vr.get('timestamp'),
+                                utc_index_time(rec.get('timestamp')),
                                 vr.get('type'),
                                 tool_name,
                                 tool_use_id,
@@ -381,8 +501,7 @@ class HistoryIndexer:
             return
 
         # Use file mtime as timestamp
-        from datetime import datetime
-        timestamp = datetime.fromtimestamp(current_mtime).strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = mtime_to_utc_time(current_mtime)
 
         self.db.execute("""
             INSERT INTO records
@@ -430,8 +549,7 @@ class HistoryIndexer:
         except (IOError, OSError):
             return
 
-        from datetime import datetime
-        timestamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = mtime_to_utc_time(mtime)
 
         # Extract original file path from JSONL if possible (we don't have it here)
         # For now, store backup_id as identifier

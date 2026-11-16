@@ -15,6 +15,14 @@ from pathlib import Path
 # SQLite database path (outside ~/.claude to avoid triggering Claude's watchers)
 DB_PATH = Path.home() / ".local/share/claude-history-index/history.db"
 
+# Index format version, kept in the database's PRAGMA user_version.
+# 0: timestamps in the indexer process's local time zone.
+# 1: timestamps in UTC; transcript records other than user/assistant messages not indexed.
+INDEX_VERSION = 1
+
+# Timestamp format of the index (UTC from version 1 on) and of the output (local time)
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 # All valid record types
 ALL_TYPES = [
     "main_user_text", "main_assistant_text", "main_assistant_thinking",
@@ -282,9 +290,16 @@ def search_sqlite(
     Content is prefiltered in SQL with LIKE conditions derived from the term
     (a superset of the real matcher's semantics), then every row is verified
     with `matcher` so results are identical to the JSONL path.
+
+    time_from/time_to are naive local datetimes; returned timestamps are local.
     """
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
+    # An index not yet migrated to version 1 holds the indexer's local time;
+    # it is compared and shown as is, as before.
+    utc_index = db.execute("PRAGMA user_version").fetchone()[0] >= 1
+    to_index_time = local_to_utc_time if utc_index else (lambda dt: dt.strftime(TIME_FORMAT))
+    from_index_time = utc_time_to_local if utc_index else (lambda s: s)
 
     params = []
     conditions = []
@@ -312,10 +327,10 @@ def search_sqlite(
     # Time filters
     if time_from:
         conditions.append("timestamp >= ?")
-        params.append(time_from.strftime("%Y-%m-%d %H:%M:%S"))
+        params.append(to_index_time(time_from))
     if time_to:
         conditions.append("timestamp <= ?")
-        params.append(time_to.strftime("%Y-%m-%d %H:%M:%S"))
+        params.append(to_index_time(time_to))
 
     # Project filter
     if project_name:
@@ -355,7 +370,7 @@ def search_sqlite(
             continue
         results.append({
             "uuid": row["uuid"] or "",
-            "timestamp": row["timestamp"] or "",
+            "timestamp": from_index_time(row["timestamp"] or ""),
             "type": row["record_type"],
             "tool_name": row["tool_name"],
             "content": content,
@@ -422,6 +437,8 @@ def search_snapshots_sqlite(
 
     db = sqlite3.connect(DB_PATH)
     db.row_factory = sqlite3.Row
+    utc_index = db.execute("PRAGMA user_version").fetchone()[0] >= 1
+    to_index_time = local_to_utc_time if utc_index else (lambda dt: dt.strftime(TIME_FORMAT))
 
     params = []
     conditions = []
@@ -450,10 +467,10 @@ def search_snapshots_sqlite(
 
     if time_from:
         conditions.append("timestamp >= ?")
-        params.append(time_from.strftime("%Y-%m-%d %H:%M:%S"))
+        params.append(to_index_time(time_from))
     if time_to:
         conditions.append("timestamp <= ?")
-        params.append(time_to.strftime("%Y-%m-%d %H:%M:%S"))
+        params.append(to_index_time(time_to))
 
     if session_id:
         conditions.append("session_id LIKE ?")
@@ -472,6 +489,8 @@ def search_snapshots_sqlite(
 
     db.close()
 
+    if utc_index:
+        return [dict(row, timestamp=utc_time_to_local(row["timestamp"] or "")) for row in rows]
     return [dict(row) for row in rows]
 
 
@@ -1377,9 +1396,15 @@ def expand_record(rec, records=None, agent_id=None):
 
     Yields dicts with: type, content, tool_name, uuid, timestamp, agent_id, and original rec reference.
     """
+    json_type = rec.get("type")
+    # Only user and assistant records are messages. Others can carry message
+    # content too: "api-request-blob" records repeat the API request's messages,
+    # without uuid or timestamp.
+    if json_type not in ("user", "assistant"):
+        return
+
     uuid = rec.get("uuid", "")[:12]
     timestamp = utc_to_local(rec.get("timestamp", ""))
-    json_type = rec.get("type")
 
     def make_type(base_type):
         """Convert base type to full type name."""
@@ -1838,6 +1863,38 @@ def utc_to_local(ts):
         return local_dt.strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, AttributeError):
         return ts[:19] if ts else ""
+
+
+def utc_index_time(ts):
+    """Convert a transcript's ISO timestamp to the index's UTC time string."""
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime(TIME_FORMAT)
+
+
+def mtime_to_utc_time(mtime):
+    """Convert a file modification time to the index's UTC time string."""
+    return datetime.fromtimestamp(mtime, timezone.utc).strftime(TIME_FORMAT)
+
+
+def local_to_utc_time(dt):
+    """Convert a naive local datetime (as from parse_local_time) to the index's UTC time string."""
+    return dt.astimezone(timezone.utc).strftime(TIME_FORMAT)
+
+
+def utc_time_to_local(s):
+    """Convert the index's UTC time string to a local time string."""
+    try:
+        dt = datetime.strptime(s, TIME_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return s
+    return dt.astimezone().strftime(TIME_FORMAT)
 
 
 def utc_to_local_dt(ts):
