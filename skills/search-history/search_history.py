@@ -5,6 +5,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import sqlite3
 import sys
 import time
@@ -632,8 +633,7 @@ def run_expand(args):
     # No session prefix - use normal project resolution
     project_dirs = resolve_project_dirs(args.project, args.cwd)
     if not project_dirs:
-        print("Project not found", file=sys.stderr)
-        return
+        _no_project_found(args.project)
 
     session_files = resolve_session_files(args, project_dirs[0])
     result = expand_uuid(uuid_prefix, session_files=session_files, project_dir=project_dirs[0], agent_id=agent_id)
@@ -788,11 +788,13 @@ def run_search(args):
     search_main = type_list is None or any(t in MAIN_TYPES for t in type_list)
     search_agents = args.agent or (type_list and any(t in AGENT_TYPES for t in type_list))
 
-    # Resolve which sessions to search
-    project_dirs = resolve_project_dirs(args.project, args.cwd, all_projects=args.all_projects)
+    # Resolve which sessions to search. Session IDs are unique across projects,
+    # so --session without --project looks in all of them.
+    project_dirs = resolve_project_dirs(
+        args.project, args.cwd,
+        all_projects=args.all_projects or bool(args.session and not args.project))
     if not project_dirs:
-        print("Project not found", file=sys.stderr)
-        sys.exit(1)
+        _no_project_found(args.project)
 
     session_files = []
     for pd in project_dirs:
@@ -906,23 +908,21 @@ def _run_search_sqlite(args, type_list, time_from, time_to, matcher):
     if type_list is None:
         type_list = MAIN_TYPES + (AGENT_TYPES if args.agent else [])
 
-    # Determine project filter
+    # Determine project and session filters
     project_name = None
-    session_id = args.session if hasattr(args, 'session') and args.session else None
+    session_id = args.session
 
     if args.project:
         project_name = _path_to_project_name(args.project.removesuffix("/**").rstrip("/"))
-    elif not args.all_projects:
-        # Try to auto-detect current session across all projects (CWD-independent)
-        detected_proj, detected_session = detect_current_session()
-        if detected_proj:
-            project_name = detected_proj.name
-            if not session_id and not args.all_sessions:
-                session_id = detected_session
-        else:
-            # Fall back to CWD-based project detection
-            cwd = args.cwd or os.getcwd()
-            project_name = _path_to_project_name(cwd)
+    elif not args.all_projects and not args.session:
+        # Default: the session this command runs in, whatever the shell's cwd
+        # (session IDs are unique, so an explicit --session needs no project)
+        project_dirs = resolve_project_dirs(None, args.cwd)
+        if not project_dirs:
+            _no_project_found()
+        project_name = project_dirs[0].name
+        if not args.all_sessions:
+            session_id = get_current_session_id(project_dirs[0])
 
     results = search_sqlite(
         term=args.term,
@@ -992,8 +992,7 @@ def run_list_sessions(args):
     """List sessions in a project."""
     project_dirs = resolve_project_dirs(args.project, args.cwd, all_projects=args.all_projects)
     if not project_dirs:
-        print("Project not found", file=sys.stderr)
-        sys.exit(1)
+        _no_project_found(args.project)
 
     # For current session detection, only check current project
     current_proj = resolve_project_dirs(None, args.cwd)
@@ -1022,196 +1021,214 @@ def run_list_sessions(args):
 # Session/project resolution
 # -----------------------------------------------------------------------------
 
+_current_session = None  # cache for detect_current_session()
+
+
 def detect_current_session():
-    """Find current session across ALL projects by locating our own invocation.
+    """Find the session this command runs in, across all projects.
+
+    Claude Code exports the session ID as CLAUDE_CODE_SESSION_ID to the commands
+    it runs; subagents get their parent session's ID. Without it (older Claude
+    Code versions, or a shell outside Claude Code), look for our own invocation
+    in the recently written transcripts.
 
     Returns (project_dir, session_id) or (None, None) if not found.
     """
-    my_args = sys.argv[1:] if len(sys.argv) > 1 else []
+    global _current_session
+    if _current_session is None:
+        _current_session = (_session_from_env() or _session_from_invocation()
+                            or (None, None))
+    return _current_session
+
+
+def _session_from_env():
+    """(project_dir, session_id) for CLAUDE_CODE_SESSION_ID, or None."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if not re.fullmatch(r"[0-9A-Za-z-]+", sid):
+        return None
+    for project_dir in _project_dirs():
+        if (project_dir / f"{sid}.jsonl").is_file():
+            return project_dir, sid
+    return None
+
+
+def _session_from_invocation():
+    """(project_dir, session_id) of a transcript that recorded this command, or None."""
+    my_args = sys.argv[1:]
     now = time.time()
 
     # Find all recently modified JSONL files across all projects (last 30 sec)
     candidates = []
-    for project_dir in PROJECTS_DIR.iterdir():
-        if not project_dir.is_dir():
-            continue
+    for project_dir in _project_dirs():
         for f in project_dir.glob("*.jsonl"):
             if "agent-" in f.name:
                 continue
-            try:
-                mtime = f.stat().st_mtime
-                if now - mtime < 30:
-                    candidates.append((f, mtime, project_dir))
-            except OSError:
-                continue
+            mtime = _mtime(f)
+            if mtime is not None and now - mtime < 30:
+                candidates.append((f, mtime, project_dir))
 
     # Sort by most recent first
     candidates.sort(key=lambda x: -x[1])
 
-    # Check each for our own invocation using shlex-based parsing
     for f, mtime, project_dir in candidates:
         if _find_our_invocation_in_tail(f, my_args):
             age = now - mtime
             print(f"Auto-detected session (JSONL age: {age:.1f}s)", file=sys.stderr)
             return project_dir, f.stem
-
-    return None, None
-
-
-def get_current_session_id(project_dir):
-    """Find current session by locating our own invocation, fallback to mtime."""
-    my_cmd = " ".join(sys.argv)
-    now = time.time()
-    recent = [(f, f.stat().st_mtime) for f in project_dir.glob("*.jsonl")
-              if "agent-" not in f.name and now - f.stat().st_mtime < 300]
-    recent.sort(key=lambda x: -x[1])
-
-    for f, _ in recent:
-        if _cmd_in_tail(f, my_cmd):
-            return f.stem
-    return recent[0][0].stem if recent else _newest_session_id(project_dir)
-
-
-def _cmd_in_tail(path, cmd, tail_bytes=100000):
-    try:
-        with open(path, 'rb') as f:
-            f.seek(0, 2)
-            f.seek(max(0, f.tell() - tail_bytes), 0)
-            return cmd in f.read().decode('utf-8', errors='ignore')
-    except Exception:
-        return False
-
-
-def _extract_script_args(bash_cmd, script_name):
-    """Extract args for a script from a bash command using shlex.
-
-    Given a bash command like:
-        cd /tmp && uv run ~/.../search_history.py "term" -t foo 2>&1
-    Returns ['term', '-t', 'foo'] if script_name is 'search_history.py'
-    """
-    import shlex
-    import re
-    try:
-        tokens = shlex.split(bash_cmd)
-    except ValueError:
-        return None
-
-    # Find the script in tokens
-    for i, tok in enumerate(tokens):
-        if tok.endswith(script_name) or tok == script_name:
-            # Return everything after the script, filtering shell redirections
-            args = tokens[i + 1:]
-            # Filter out shell redirections like 2>&1, >/dev/null, etc.
-            args = [a for a in args if not re.match(r'^[0-9]*[<>]', a)]
-            return args
     return None
 
 
-def _find_our_invocation_in_tail(path, my_args, tail_bytes=100000):
-    """Check if this JSONL file's tail contains our invocation.
+def get_current_session_id(project_dir):
+    """The session this command runs in if it belongs to project_dir, else the project's newest."""
+    detected_dir, sid = detect_current_session()
+    if sid and detected_dir.name == project_dir.name:
+        return sid
+    return _newest_session_id(project_dir)
 
-    Parses Bash commands and compares extracted args with my_args.
+
+def _shell_tokens(command):
+    """Split a shell command into words and operators (|, &&, ;, >, 2>&1 -> 2 >& 1, ...)."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:
+        return []
+
+
+def _is_shell_operator(token):
+    return bool(token) and set(token) <= set("();<>|&")
+
+
+def _command_runs_script(command, script_name, args):
+    """Whether a shell command calls script_name with exactly these args.
+
+    The call's arguments end at a pipe, a command separator, a redirection or a
+    closing parenthesis, as in `... search_history.py -c --last 5 2>&1 | tail`.
     """
-    import json
-    import re
+    tokens = _shell_tokens(command)
+    n = len(args)
+    for i, token in enumerate(tokens):
+        if token != script_name and not token.endswith("/" + script_name):
+            continue
+        if tokens[i + 1:i + 1 + n] != args:
+            continue
+        rest = tokens[i + 1 + n:]
+        if not rest or _is_shell_operator(rest[0]):
+            return True
+        # A file descriptor number before a redirection (the 2 of 2>&1 or 2>/dev/null)
+        if rest[0].isdigit() and len(rest) > 1 and _is_shell_operator(rest[1]) and rest[1][0] in "<>":
+            return True
+    return False
 
+
+def _find_our_invocation_in_tail(path, my_args, tail_bytes=100000):
+    """Check if this JSONL file's tail contains a Bash call of this script with my_args."""
     try:
         with open(path, 'rb') as f:
             f.seek(0, 2)
             size = f.tell()
             f.seek(max(0, size - tail_bytes), 0)
             tail = f.read().decode('utf-8', errors='ignore')
-    except Exception:
+    except OSError:
         return False
 
     # Find all "command":"..." patterns (Bash tool inputs)
     for match in re.finditer(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)"', tail):
-        cmd_escaped = match.group(1)
-        # Unescape JSON string
         try:
-            cmd = json.loads(f'"{cmd_escaped}"')
+            cmd = json.loads(f'"{match.group(1)}"')
         except json.JSONDecodeError:
             continue
-
-        if 'search_history.py' not in cmd:
-            continue
-
-        extracted = _extract_script_args(cmd, 'search_history.py')
-        if extracted == my_args:
+        if 'search_history.py' in cmd and _command_runs_script(cmd, 'search_history.py', my_args):
             return True
-
     return False
 
 
+def _no_project_found(project_arg=None):
+    if project_arg:
+        print(f"Project not found: {project_arg}", file=sys.stderr)
+    else:
+        print("No current session or project found: run this from within Claude Code, or pass "
+              "--project, --session, --all-projects or --cwd", file=sys.stderr)
+    sys.exit(1)
+
+
+def _mtime(path):
+    """Modification time, or None if the path vanished meanwhile."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _by_mtime(paths):
+    """Paths sorted newest first, leaving out any that vanished meanwhile."""
+    stamped = [(m, p) for p in paths if (m := _mtime(p)) is not None]
+    return [p for m, p in sorted(stamped, key=lambda x: x[0], reverse=True)]
+
+
+def _project_dirs():
+    """All project directories (unsorted)."""
+    try:
+        return [d for d in PROJECTS_DIR.iterdir() if d.is_dir()]
+    except OSError:
+        return []
+
+
+def _session_files(project_dir):
+    """Main session transcripts of a project (unsorted)."""
+    return [f for f in project_dir.glob("*.jsonl") if "agent-" not in f.name]
+
+
 def _newest_session_id(project_dir):
-    files = [f for f in project_dir.glob("*.jsonl") if "agent-" not in f.name]
-    return max(files, key=os.path.getmtime).stem if files else None
+    files = _by_mtime(_session_files(project_dir))
+    return files[0].stem if files else None
 
 
 def resolve_project_dirs(project_arg, cwd=None, all_projects=False):
-    """Resolve project dir(s) from --project or cwd. Returns list.
+    """Resolve project dir(s) from --project, the current session or cwd. Returns list.
 
     Use /** suffix to include subdirs: /path/to/proj/** matches proj and children.
     Without /**: /path/to/proj matches only that exact project.
     all_projects: if True, return all project directories.
+    Default: the project of the session this command runs in; with an explicit
+    cwd, or if that session is unknown, the project of the (current) directory.
     """
     if all_projects:
-        return sorted([d for d in PROJECTS_DIR.iterdir() if d.is_dir()],
-                      key=lambda d: d.stat().st_mtime, reverse=True)
+        return _by_mtime(_project_dirs())
     if project_arg:
         include_subdirs = project_arg.endswith("/**")
         path = project_arg.removesuffix("/**").rstrip("/")
         prefix = _path_to_project_name(path)
         if include_subdirs:
             # Match exact or followed by - (path component boundary)
-            matches = [d for d in PROJECTS_DIR.iterdir()
-                       if d.is_dir() and (d.name == prefix or d.name.startswith(prefix + "-"))]
+            matches = [d for d in _project_dirs()
+                       if d.name == prefix or d.name.startswith(prefix + "-")]
         else:
-            matches = [d for d in PROJECTS_DIR.iterdir()
-                       if d.is_dir() and d.name == prefix]
+            matches = [d for d in _project_dirs() if d.name == prefix]
         return sorted(matches, key=lambda d: len(d.name))  # shortest first
-    # Try cwd first
-    cwd = cwd or os.getcwd()
-    name = _path_to_project_name(cwd)
-    d = PROJECTS_DIR / name
-    if d.exists():
-        return [d]
-    # cwd didn't match - search all projects for our session
-    found = _find_project_by_session()
-    return [found] if found else []
-
-
-def _find_project_by_session():
-    """Search all projects for a recent session containing our invocation."""
-    my_cmd = " ".join(sys.argv)
-    now = time.time()
-    for project_dir in PROJECTS_DIR.iterdir():
-        if not project_dir.is_dir():
-            continue
-        for f in project_dir.glob("*.jsonl"):
-            if "agent-" in f.name:
-                continue
-            if now - f.stat().st_mtime > 300:
-                continue
-            if _cmd_in_tail(f, my_cmd):
-                return project_dir
-    return None
+    if cwd is None:
+        detected_dir, _ = detect_current_session()
+        if detected_dir:
+            return [detected_dir]
+    d = PROJECTS_DIR / _path_to_project_name(cwd or os.getcwd())
+    return [d] if d.is_dir() else []
 
 
 def _path_to_project_name(path):
-    """Convert filesystem path to Claude project directory name."""
-    return "-" + path.lstrip("/").replace("/", "-").replace(".", "-").replace("_", "-")
+    """Convert filesystem path to Claude project directory name (as Claude Code
+    does: every character other than a letter or digit becomes '-')."""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
 
 
 def resolve_session_files(args, project_dir):
     """Get list of session files to search based on args."""
-    all_sessions = [f for f in project_dir.glob("*.jsonl") if "agent-" not in f.name]
+    all_sessions = _session_files(project_dir)
     if args.all_sessions:
-        return sorted(all_sessions, key=os.path.getmtime, reverse=True)
+        return _by_mtime(all_sessions)
     if args.session:
         # Prefix match on session ID
-        return sorted([f for f in all_sessions if f.stem.startswith(args.session)],
-                      key=os.path.getmtime, reverse=True)
+        return _by_mtime(f for f in all_sessions if f.stem.startswith(args.session))
     # Default: current/most recent session only
     sid = get_current_session_id(project_dir)
     f = project_dir / f"{sid}.jsonl" if sid else None
@@ -1242,20 +1259,18 @@ def get_agent_files(project_dir, session_id=None, agent_filter=None):
                 pass
         agent_files = filtered
 
-    return sorted(agent_files, key=os.path.getmtime, reverse=True)
+    return _by_mtime(agent_files)
 
 
 def list_projects():
     """Return list of (name, path, n_sessions, mtime) tuples."""
     result = []
-    for d in PROJECTS_DIR.iterdir():
-        if not d.is_dir():
-            continue
-        sessions = [f for f in d.glob("*.jsonl") if "agent-" not in f.name]
+    for d in _project_dirs():
+        sessions = _by_mtime(_session_files(d))
         if not sessions:
             continue
-        newest = max(sessions, key=os.path.getmtime)
-        mtime = datetime.fromtimestamp(newest.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        newest_mtime = _mtime(sessions[0]) or 0
+        mtime = datetime.fromtimestamp(newest_mtime).strftime("%Y-%m-%d %H:%M")
         path = "/" + d.name[1:].replace("-", "/")
         result.append((d.name, path, len(sessions), mtime))
     return sorted(result, key=lambda x: x[3], reverse=True)
@@ -1264,10 +1279,11 @@ def list_projects():
 def list_sessions(project_dir, detailed=False):
     """Return list of session info dicts."""
     result = []
-    for f in project_dir.glob("*.jsonl"):
-        if "agent-" in f.name:
+    for f in _session_files(project_dir):
+        f_mtime = _mtime(f)
+        if f_mtime is None:  # vanished meanwhile
             continue
-        mtime = datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        mtime = datetime.fromtimestamp(f_mtime).strftime("%Y-%m-%d %H:%M")
         info = _session_summary(f, detailed=detailed)
         info["id"] = f.stem
         info["mtime"] = mtime
@@ -1727,26 +1743,33 @@ def load_history(cwd=None):
 
 
 def load_history_file(path):
-    """Load all records from a specific history file."""
+    """Load all records from a specific history file (none if it vanished)."""
     records = []
-    with open(path) as f:
-        for line in f:
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        pass
     return records
 
 
 def get_history_file(cwd=None):
-    """Find the current conversation's history file."""
-    if cwd is None:
-        cwd = os.getcwd()
-    project_name = _path_to_project_name(cwd)
-    project_dir = Path.home() / ".claude/projects" / project_name
+    """Find the current conversation's history file.
 
-    files = sorted(project_dir.glob("*.jsonl"), key=os.path.getmtime, reverse=True)
-    files = [f for f in files if "agent-" not in f.name]
+    Default: the session this command runs in; with an explicit cwd, or if that
+    session is unknown, the newest session of the (current) directory's project.
+    """
+    if cwd is None:
+        project_dir, sid = detect_current_session()
+        if sid:
+            return project_dir / f"{sid}.jsonl"
+        cwd = os.getcwd()
+    project_dir = PROJECTS_DIR / _path_to_project_name(cwd)
+    files = _by_mtime(_session_files(project_dir))
     return files[0] if files else None
 
 

@@ -123,8 +123,12 @@ search_history.py "term" --session ae6a59bd
 ## Usage
 
 ```bash
-python ~/.claude/skills/search-history/search_history.py [OPTIONS] [TERM]
+~/.claude/skills/search-history/search_history.py [OPTIONS] [TERM]
+# or, equivalently:
+python3 ~/.claude/skills/search-history/search_history.py [OPTIONS] [TERM]
 ```
+
+The script is executable; the examples abbreviate its path to `search_history.py`. It can be run from any directory: the current session is the one Claude Code names in `CLAUDE_CODE_SESSION_ID`, whatever the shell's working directory (subagents share their parent's session). Times are local, in input and output.
 
 ## Search
 
