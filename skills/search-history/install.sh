@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Install the history indexer daemon as a background service: a systemd user
-# service on Linux, a launchd agent on macOS.
+# service on Linux, a launchd agent on macOS. Run it again after an update of
+# the skill: it restarts the daemon, which then migrates an older index in place.
 # The search itself (search_history.py) works without the daemon by scanning
-# JSONL files directly; the daemon adds the fast SQLite index and plan search.
+# JSONL files directly; the daemon adds the SQLite index, which is fast and
+# keeps what Claude Code deletes.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,10 +21,12 @@ Linux)
     mkdir -p "$UNIT_DIR"
     cp claude-history-indexer.service "$UNIT_DIR/"
     systemctl --user daemon-reload
-    systemctl --user enable --now claude-history-indexer.service
+    systemctl --user enable claude-history-indexer.service
+    # Starts it, or restarts a running one so that it runs the current code
+    systemctl --user restart claude-history-indexer.service
 
-    echo "Installed and started claude-history-indexer.service"
-    echo "Index DB: ~/.local/share/claude-history-index/history.db (created and synced automatically)"
+    echo "Installed and (re)started claude-history-indexer.service"
+    echo "Index DB: ~/.local/share/claude-history-index/history.db (created, migrated and synced automatically)"
     echo "Check status: systemctl --user status claude-history-indexer.service"
     ;;
 
@@ -91,8 +95,8 @@ EOF
     fi
     launchctl bootstrap "$DOMAIN" "$PLIST"
 
-    echo "Installed and started $LABEL"
-    echo "Index DB: ~/.local/share/claude-history-index/history.db (created and synced automatically)"
+    echo "Installed and (re)started $LABEL"
+    echo "Index DB: ~/.local/share/claude-history-index/history.db (created, migrated and synced automatically)"
     echo "Check status: launchctl print $DOMAIN/$LABEL | head -20"
     echo "Log: ~/Library/Logs/claude-history-indexer.log"
     ;;
