@@ -12,6 +12,7 @@ import shlex
 import sqlite3
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -64,7 +65,8 @@ ORIGINS = ["human", "agent", "coordinator", "task-notification"]
 
 
 # -----------------------------------------------------------------------------
-# Regex to FTS query extraction - handles AND/OR from alternations
+# Regex -> the literals a match must contain (AND/OR from alternations), for the
+# SQL prefilter of a search
 # -----------------------------------------------------------------------------
 
 try:
@@ -79,7 +81,7 @@ except ImportError:
 
 
 def _extract_fts_tree(pattern):
-    """Extract FTS query tree from regex pattern.
+    """Extract the tree of required literals from a regex pattern.
 
     Returns tree of ('LIT', str), ('AND', [...]), ('OR', [...]) or None.
     Handles alternation as OR, sequential literals as AND.
@@ -231,36 +233,6 @@ def _prepend_prefix(node, prefix):
     return node
 
 
-def _tree_to_fts(node):
-    """Convert tree to FTS5 query string."""
-    if node is None:
-        return None
-
-    if node[0] == 'LIT':
-        lit = node[1].replace('"', '""')
-        return f'"{lit}"'
-
-    if node[0] == 'AND':
-        subs = [_tree_to_fts(n) for n in node[1]]
-        subs = [s for s in subs if s]
-        if not subs:
-            return None
-        if len(subs) == 1:
-            return subs[0]
-        return ' '.join(subs)
-
-    if node[0] == 'OR':
-        subs = [_tree_to_fts(n) for n in node[1]]
-        subs = [s for s in subs if s]
-        if not subs:
-            return None
-        if len(subs) == 1:
-            return subs[0]
-        return '(' + ' OR '.join(subs) + ')'
-
-    return None
-
-
 def _extract_fts_tree_naive(pattern):
     """Fallback: extract literals by splitting on metacharacters."""
     chunks = re.split(r'[\\.*+?^${}()|[\]\s]+', pattern)
@@ -272,35 +244,101 @@ def _extract_fts_tree_naive(pattern):
     return ('AND', lits)
 
 
-def _extract_fts_query(pattern):
-    """Main entry: regex pattern -> FTS query string or None."""
-    tree = _extract_fts_tree(pattern)
-    return _tree_to_fts(tree)
-
-
 def _is_regex(pattern):
     """Check if pattern contains regex metacharacters."""
     return bool(re.search(r'[\\.*+?^${}()|[\]]', pattern))
 
 
 # -----------------------------------------------------------------------------
-# SQLite search functions
+# Reading the index (SQLite)
 # -----------------------------------------------------------------------------
+
+# Record types by what scopes them: a session, a project, or nothing
+_SESSION_SCOPED = MAIN_TYPES + AGENT_TYPES + ["tool_file", "subagent_meta", "prompt_history"]
+_PROJECT_SCOPED = ["memory"]
+_UNSCOPED = ["plan", "paste"]
+
+_index = None  # open_index()'s connection; False once it is known that there is none
+
+
+def open_index():
+    """Read-only connection to the index, or None if there is none this version can read."""
+    global _index
+    if _index is None:
+        _index = _connect_index() or False
+    return _index or None
+
+
+def _connect_index():
+    if not DB_PATH.exists():
+        return None
+    try:
+        db = sqlite3.connect(f"file:{urllib.parse.quote(str(DB_PATH))}?mode=ro", uri=True)
+        db.row_factory = sqlite3.Row
+        version = db.execute("PRAGMA user_version").fetchone()[0]
+        if version != INDEX_VERSION:
+            what = ("the indexer has not migrated it yet (restart claude-history-indexer)"
+                    if version < INDEX_VERSION else "update this skill")
+            print(f"Index {DB_PATH} has format {version}, this search reads format {INDEX_VERSION}: "
+                  f"{what}. Reading the transcript files instead.", file=sys.stderr)
+            db.close()
+            return None
+        if not db.execute("SELECT 1 FROM records LIMIT 1").fetchone():
+            db.close()
+            return None
+        return db
+    except sqlite3.Error:
+        return None
+
 
 def db_available():
     """Check if SQLite database is available and has data."""
-    if not DB_PATH.exists():
-        return False
-    try:
-        db = sqlite3.connect(DB_PATH)
-        count = db.execute("SELECT COUNT(*) FROM records").fetchone()[0]
-        db.close()
-        return count > 0
-    except (sqlite3.Error, sqlite3.OperationalError):
-        return False
+    return open_index() is not None
+
+
+def _like_prefix(value):
+    """LIKE pattern for "starts with value" (with ESCAPE '\\')."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _prefix_range(column, prefix):
+    """SQL condition and parameters for "column starts with prefix", in a form that
+    can use an index on the column (LIKE cannot: it ignores the case of ASCII letters)."""
+    return f"({column} >= ? AND {column} < ?)", [prefix, prefix + "\U0010ffff"]
+
+
+def _session_condition(db, prefix):
+    """SQL condition and parameters for "session id starts with prefix".
+
+    The ids are looked up first so that the search can use the index on session_id.
+    """
+    ids = [row[0] for row in db.execute(
+        "SELECT session_id FROM sessions WHERE session_id LIKE ? ESCAPE '\\'", (_like_prefix(prefix),))]
+    if ids:
+        return f"session_id IN ({','.join('?' * len(ids))})", ids
+    return _prefix_range("session_id", prefix)
+
+
+def _project_condition(project_name, with_subdirs=False):
+    if with_subdirs:
+        return "(project_name = ? OR project_name LIKE ? ESCAPE '\\')", [project_name,
+                                                                         _like_prefix(project_name + "-")]
+    return "project_name = ?", [project_name]
+
+
+def _row_to_result(row):
+    """A records row as the dict the display functions take (timestamp in local time)."""
+    result = dict(row)
+    result["type"] = result.pop("record_type")
+    result["content"] = result["content"] or ""
+    result["uuid"] = result["uuid"] or ""
+    result["timestamp_utc"] = result["timestamp"] or ""
+    result["timestamp"] = utc_time_to_local(result["timestamp"] or "")
+    return result
 
 
 def search_sqlite(
+    db,
     term=None,
     matcher=None,
     is_regex=True,
@@ -309,8 +347,10 @@ def search_sqlite(
     time_from=None,
     time_to=None,
     project_name=None,
+    with_subdirs=False,
     session_id=None,
     agent_id=None,
+    origin=None,
     ignore_case=False,
 ):
     """Search records in SQLite.
@@ -319,19 +359,38 @@ def search_sqlite(
     (a superset of the real matcher's semantics), then every row is verified
     with `matcher` so results are identical to the JSONL path.
 
+    type_list: record types (None: all). A session filter applies to the types
+    that belong to a session, a project filter also to memory notes; plans and
+    the paste cache belong to neither.
     time_from/time_to are naive local datetimes; returned timestamps are local.
+    session_id and agent_id are prefixes. Returns None on an SQLite error.
     """
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    # An index not yet migrated to version 1 holds the indexer's local time;
-    # it is compared and shown as is, as before.
-    utc_index = db.execute("PRAGMA user_version").fetchone()[0] >= 1
-    to_index_time = local_to_utc_time if utc_index else (lambda dt: dt.strftime(TIME_FORMAT))
-    from_index_time = utc_time_to_local if utc_index else (lambda s: s)
-
     params = []
     conditions = []
-    sql = "SELECT * FROM records WHERE 1=1"
+
+    # Scope, by kind of record
+    types = type_list if type_list is not None else ALL_TYPES
+    scopes = []
+    for group, by_session, by_project in ((_SESSION_SCOPED, True, True), (_PROJECT_SCOPED, False, True),
+                                          (_UNSCOPED, False, False)):
+        wanted = [t for t in types if t in group]
+        if not wanted:
+            continue
+        parts = [f"record_type IN ({','.join('?' * len(wanted))})"]
+        scope_params = list(wanted)
+        if by_session and session_id:
+            sql, more = _session_condition(db, session_id)
+            parts.append(sql)
+            scope_params += more
+        if by_project and project_name:
+            sql, more = _project_condition(project_name, with_subdirs)
+            parts.append(sql)
+            scope_params += more
+        scopes.append("(" + " AND ".join(parts) + ")")
+        params += scope_params
+    if not scopes:
+        return []
+    conditions.append("(" + " OR ".join(scopes) + ")")
 
     # Content prefilter (never excludes true matches; matcher verifies below)
     if term:
@@ -341,81 +400,254 @@ def search_sqlite(
             conditions.append(like_sql)
             params.extend(like_params)
 
-    # Type filter
-    if type_list:
-        placeholders = ",".join("?" * len(type_list))
-        conditions.append(f"record_type IN ({placeholders})")
-        params.extend(type_list)
-
-    # Tool filter
     if tool:
         conditions.append("tool_name = ?")
         params.append(tool)
-
-    # Time filters
+    if origin:
+        conditions.append("origin = ?")
+        params.append(origin)
     if time_from:
         conditions.append("timestamp >= ?")
-        params.append(to_index_time(time_from))
+        params.append(local_to_utc_time(time_from))
     if time_to:
         conditions.append("timestamp <= ?")
-        params.append(to_index_time(time_to))
-
-    # Project filter
-    if project_name:
-        conditions.append("project_name = ?")
-        params.append(project_name)
-
-    # Session filter
-    if session_id:
-        conditions.append("(session_id LIKE ? OR session_id = ?)")
-        params.extend([f"{session_id}%", session_id])
-
-    # Agent filter
+        params.append(local_to_utc_time(time_to))
     if agent_id:
-        conditions.append("agent_id LIKE ?")
-        params.append(f"{agent_id}%")
+        conditions.append("agent_id LIKE ? ESCAPE '\\'")
+        params.append(_like_prefix(agent_id))
 
-    # Build final query
-    if conditions:
-        sql += " AND " + " AND ".join(conditions)
-
-    sql += " ORDER BY timestamp ASC"
-
+    sql = "SELECT * FROM records WHERE " + " AND ".join(conditions) + " ORDER BY timestamp ASC, id ASC"
     try:
-        rows = db.execute(sql, params).fetchall()
+        rows = db.execute(sql, params)
+        # Convert to expected format, verifying content against the real matcher
+        return [_row_to_result(row) for row in rows if not matcher or matcher(row["content"] or "")]
     except sqlite3.Error as e:
         print(f"SQLite error: {e}", file=sys.stderr)
-        db.close()
         return None  # Signal to fall back to JSONL
 
-    db.close()
 
-    # Convert to expected format, verifying content against the real matcher
-    results = []
-    for row in rows:
-        content = row["content"] or ""
-        if matcher and not matcher(content):
-            continue
-        results.append({
-            "uuid": row["uuid"] or "",
-            "timestamp": from_index_time(row["timestamp"] or ""),
-            "type": row["record_type"],
-            "tool_name": row["tool_name"],
-            "content": content,
-            "agent_id": row["agent_id"],
-            "session_id": row["session_id"] or row["project_name"],
-        })
+def context_sqlite(db, matches, n):
+    """The matches with n items before and after each, in the order of their transcript.
 
+    Neighbors are the items of the same file (a session's transcript or an agent's),
+    whatever their type. Each result gets is_match and context_for (the uuid of the
+    match it surrounds).
+    """
+    match_ids = {m["id"] for m in matches}
+    results, seen = [], set()
+    for match in matches:
+        position = (match["source_file"], match["byte_offset"] or 0, match["byte_offset"] or 0, match["id"])
+        before = db.execute(
+            "SELECT * FROM records WHERE source_file = ? AND (byte_offset < ? OR (byte_offset = ? AND id < ?)) "
+            "ORDER BY byte_offset DESC, id DESC LIMIT ?", (*position, n)).fetchall()
+        after = db.execute(
+            "SELECT * FROM records WHERE source_file = ? AND (byte_offset > ? OR (byte_offset = ? AND id > ?)) "
+            "ORDER BY byte_offset ASC, id ASC LIMIT ?", (*position, n)).fetchall()
+        group = [_row_to_result(r) for r in reversed(before)] + [match] + [_row_to_result(r) for r in after]
+        for result in group:
+            if result["id"] in seen:
+                continue
+            seen.add(result["id"])
+            result["is_match"] = result["id"] in match_ids
+            result["context_for"] = match["uuid"]
+            results.append(result)
     return results
+
+
+def expand_sqlite(db, uuid_prefix, session_prefix=None, agent_prefix=None):
+    """Everything the index has of one transcript record, or of one indexed file.
+
+    Returns (result, candidates): result as expand_uuid() gives it plus "rows" (its
+    items as search results), or None with the rows of the several records that the
+    prefix matches.
+    """
+    sql, params = _prefix_range("uuid", uuid_prefix[:12])
+    conditions = [sql]
+    if session_prefix:
+        sql, more = _session_condition(db, session_prefix)
+        conditions.append(sql)
+        params += more
+    if agent_prefix:
+        conditions.append("agent_id LIKE ? ESCAPE '\\'")
+        params.append(_like_prefix(agent_prefix))
+    rows = db.execute("SELECT * FROM records WHERE " + " AND ".join(conditions)
+                      + " ORDER BY timestamp, byte_offset, id", params).fetchall()
+    if not rows:
+        return None, []
+    if len({r["uuid"] for r in rows}) > 1:
+        return None, rows  # different records: a longer prefix is needed
+
+    first = rows[0]
+    result = {
+        "uuid": first["uuid"],
+        "timestamp": utc_time_to_local(first["timestamp"] or ""),
+        "type": first["record_type"],
+        "session_id": first["session_id"],
+        "agent_id": first["agent_id"],
+        "source_file": first["source_file"],
+        "content": None,
+        "thinking": None,
+        "tool_uses": [],
+        "rows": [_row_to_result(r) for r in rows],
+    }
+    kinds = {r["record_type"].split("_", 1)[-1] for r in rows}
+    if kinds & {"assistant_text", "assistant_thinking", "tool_input"}:
+        result["type"] = "assistant"
+    elif kinds & {"user_text", "meta_text", "input_text", "tool_output", "summary"}:
+        result["type"] = "user"
+    texts, thinking = [], []
+    for row in rows:
+        kind = row["record_type"]
+        if kind.endswith("tool_input"):
+            output = db.execute(
+                "SELECT * FROM records WHERE tool_use_id = ? AND tool_use_id != '' "
+                "AND record_type IN ('main_tool_output', 'agent_tool_output') LIMIT 1",
+                (row["tool_use_id"],)).fetchone()
+            result["tool_uses"].append({
+                "name": row["tool_name"], "input": row["content"], "input_json": row["input_json"],
+                "output": output["content"] if output else None,
+                "result_json": output["result_json"] if output else None,
+                "is_error": bool(output["is_error"]) if output else False})
+            if output:
+                result["rows"].append(_row_to_result(output))
+        elif kind.endswith("tool_output"):
+            call = db.execute(
+                "SELECT * FROM records WHERE tool_use_id = ? AND tool_use_id != '' "
+                "AND record_type IN ('main_tool_input', 'agent_tool_input') LIMIT 1",
+                (row["tool_use_id"],)).fetchone()
+            result["tool_uses"].append({
+                "name": row["tool_name"], "input": call["content"] if call else None,
+                "input_json": call["input_json"] if call else None,
+                "output": row["content"], "result_json": row["result_json"],
+                "is_error": bool(row["is_error"])})
+            if call:
+                result["rows"].insert(0, _row_to_result(call))
+        elif kind.endswith("thinking"):
+            thinking.append(row["content"] or "")
+        else:
+            texts.append(row["content"] or "")
+    result["content"] = "\n".join(texts) or None
+    result["thinking"] = "\n".join(thinking) or None
+    return result, []
+
+
+def get_blob(db, digest_prefix):
+    """(hash, media type, data) of the blobs whose SHA-256 starts with digest_prefix (at most 5)."""
+    sql, params = _prefix_range("hash", digest_prefix.removeprefix("sha256:").lower())
+    return [tuple(row) for row in db.execute(
+        f"SELECT hash, media_type, data FROM blobs WHERE {sql} LIMIT 5", params)]
+
+
+def snapshots_sqlite(db, session_id=None, project_name=None, with_subdirs=False, filename_filter=None,
+                     backup_prefix=None, version=None, msgid=None, time_from=None, time_to=None, term=None):
+    """File snapshots from the index, oldest first: one per stored file version.
+
+    session_id is a prefix; time_from/time_to are naive local datetimes; term is
+    searched in the content without regard to case. Timestamps are returned local.
+    """
+    conditions, params = [], []
+    if session_id:
+        sql, more = _session_condition(db, session_id)
+        conditions.append(sql)
+        params += more
+    if project_name:
+        sql, more = _project_condition(project_name, with_subdirs)
+        conditions.append(f"session_id IN (SELECT session_id FROM sessions WHERE {sql})")
+        params += more
+    if filename_filter:
+        conditions.append("(file_path LIKE ? ESCAPE '\\' OR backup_id LIKE ? ESCAPE '\\')")
+        params += ["%" + _like_prefix(filename_filter)] * 2
+    if backup_prefix:
+        conditions.append("backup_id LIKE ? ESCAPE '\\'")
+        params.append(_like_prefix(backup_prefix))
+    if version:
+        conditions.append("backup_id LIKE ? ESCAPE '\\'")
+        params.append("%@" + _like_prefix(version)[:-1])
+    if msgid:
+        conditions.append("message_id LIKE ? ESCAPE '\\'")
+        params.append(_like_prefix(msgid))
+    if time_from:
+        conditions.append("timestamp >= ?")
+        params.append(local_to_utc_time(time_from))
+    if time_to:
+        conditions.append("timestamp <= ?")
+        params.append(local_to_utc_time(time_to))
+    if term:
+        conditions.append("content LIKE ? ESCAPE '\\'")
+        params.append("%" + _like_prefix(term))
+    sql = "SELECT * FROM snapshots" + (" WHERE " + " AND ".join(conditions) if conditions else "") \
+        + " ORDER BY timestamp, backup_id"
+    results = []
+    for row in db.execute(sql, params):
+        result = dict(row)
+        if term and term.lower() not in (result["content"] or "").lower():
+            continue  # LIKE ignores case for ASCII only
+        result["timestamp"] = utc_time_to_local(result["timestamp"] or "")
+        results.append(result)
+    return results
+
+
+def sessions_sqlite(db, project_name=None, with_subdirs=False, detailed=False):
+    """Sessions in the index, newest first, as list_sessions() gives them, plus the
+    project, the title and whether the transcript file still exists."""
+    sql, params = "SELECT * FROM sessions", []
+    if project_name:
+        condition, params = _project_condition(project_name, with_subdirs)
+        sql += " WHERE " + condition
+    main_types = ",".join(f"'{t}'" for t in MAIN_TYPES)
+    results = []
+    for row in db.execute(sql, params).fetchall():
+        sid = row["session_id"]
+        info = {"id": sid, "project": row["project_name"], "title": row["custom_title"] or row["title"],
+                "last_ts": row["last_ts"] or "",
+                "mtime": utc_time_to_local(row["last_ts"] or "")[:16],
+                "on_disk": bool(row["source_file"]) and os.path.exists(row["source_file"])}
+        info["msgs"] = db.execute(
+            f"SELECT COUNT(DISTINCT uuid) FROM records WHERE session_id = ? AND record_type IN ({main_types})",
+            (sid,)).fetchone()[0]
+        preview = db.execute(
+            "SELECT substr(content, 1, 200) FROM records WHERE session_id = ? AND record_type = 'main_user_text' "
+            "ORDER BY timestamp, id LIMIT 1", (sid,)).fetchone()
+        info["preview"] = (preview[0] if preview else "").replace("\n", " ").strip()
+        if detailed:
+            info["duration"] = _duration(row["first_ts"], row["last_ts"])
+            info["tools"] = dict(db.execute(
+                "SELECT tool_name, COUNT(*) FROM records WHERE session_id = ? AND record_type = 'main_tool_input' "
+                "GROUP BY tool_name", (sid,)).fetchall())
+            info["files_edited"] = db.execute(
+                "SELECT COUNT(DISTINCT substr(content, 1, instr(content || char(10), char(10)) - 1)) FROM records "
+                "WHERE session_id = ? AND record_type = 'main_tool_input' AND tool_name IN ('Edit', 'Write')",
+                (sid,)).fetchone()[0]
+        results.append(info)
+    return sorted(results, key=lambda s: s["last_ts"], reverse=True)
+
+
+def projects_sqlite(db):
+    """Projects in the index as (name, path, number of sessions, last activity), newest first."""
+    rows = db.execute("SELECT project_name, COUNT(*), MAX(last_ts), MAX(cwd) FROM sessions "
+                      "WHERE project_name IS NOT NULL GROUP BY project_name").fetchall()
+    result = [(name, cwd or "/" + name[1:].replace("-", "/"), n, utc_time_to_local(last or "")[:16])
+              for name, n, last, cwd in rows]
+    return sorted(result, key=lambda x: x[3], reverse=True)
+
+
+def _duration(first_ts, last_ts):
+    """"3h 20m" between two index timestamps."""
+    try:
+        delta = datetime.strptime(last_ts, TIME_FORMAT) - datetime.strptime(first_ts, TIME_FORMAT)
+    except (TypeError, ValueError):
+        return ""
+    hours, rem = divmod(int(delta.total_seconds()), 3600)
+    return f"{hours}h {rem // 60}m" if hours > 0 else f"{rem // 60}m"
 
 
 def _term_to_like(term, is_regex, ignore_case):
     """Build a SQL LIKE prefilter for a search term, or None for no prefilter.
 
     The prefilter must be a superset of the matcher: LIKE is substring-based
-    (unlike token-based FTS) and ASCII-case-insensitive, so it can only ever
-    over-match. Non-ASCII terms with -i get no prefilter (LIKE is
-    case-sensitive beyond ASCII, which could drop true matches).
+    and ASCII-case-insensitive, so it can only ever over-match. Non-ASCII
+    terms with -i get no prefilter (LIKE is case-sensitive beyond ASCII,
+    which could drop true matches).
     """
     if ignore_case and any(ord(c) > 127 for c in term):
         return None
@@ -452,76 +684,6 @@ def _tree_to_like(node):
     return None
 
 
-def search_snapshots_sqlite(
-    term=None,
-    filename_filter=None,
-    time_from=None,
-    time_to=None,
-    session_id=None,
-):
-    """Search snapshots using SQLite."""
-    if not DB_PATH.exists():
-        return None
-
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    utc_index = db.execute("PRAGMA user_version").fetchone()[0] >= 1
-    to_index_time = local_to_utc_time if utc_index else (lambda dt: dt.strftime(TIME_FORMAT))
-
-    params = []
-    conditions = []
-
-    if term:
-        if _is_regex(term):
-            fts_query = _extract_fts_query(term)
-        else:
-            fts_query = f'"{term.replace(chr(34), chr(34)+chr(34))}"'
-
-        if fts_query:
-            sql = """
-                SELECT s.* FROM snapshots s
-                JOIN snapshots_fts ON s.id = snapshots_fts.rowid
-                WHERE snapshots_fts MATCH ?
-            """
-            params.append(fts_query)
-        else:
-            sql = "SELECT * FROM snapshots WHERE 1=1"
-    else:
-        sql = "SELECT * FROM snapshots WHERE 1=1"
-
-    if filename_filter:
-        conditions.append("(file_path LIKE ? OR backup_id LIKE ?)")
-        params.extend([f"%{filename_filter}%", f"%{filename_filter}%"])
-
-    if time_from:
-        conditions.append("timestamp >= ?")
-        params.append(to_index_time(time_from))
-    if time_to:
-        conditions.append("timestamp <= ?")
-        params.append(to_index_time(time_to))
-
-    if session_id:
-        conditions.append("session_id LIKE ?")
-        params.append(f"{session_id}%")
-
-    if conditions:
-        sql += " AND " + " AND ".join(conditions)
-
-    sql += " ORDER BY timestamp ASC"
-
-    try:
-        rows = db.execute(sql, params).fetchall()
-    except sqlite3.Error:
-        db.close()
-        return None
-
-    db.close()
-
-    if utc_index:
-        return [dict(row, timestamp=utc_time_to_local(row["timestamp"] or "")) for row in rows]
-    return [dict(row) for row in rows]
-
-
 def expand_type_pattern(pattern):
     """Expand a type pattern (with wildcards) to list of matching types."""
     if pattern is None:
@@ -552,18 +714,25 @@ def compile_search_pattern(term, ignore_case=False, is_regex=False):
         else:
             return lambda content: term in content
 
+
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+
+# Characters of an item that a listing shows, and of one part that --expand shows, without --full
+LISTING_CUT = 2000
+EXPAND_CUT = 100_000
 
 
 def main():
     parser = argparse.ArgumentParser(description="Search conversation history")
     parser.add_argument("term", nargs="?", help="Search term")
     parser.add_argument("-t", "--type",
-                        help="Record type pattern (supports * wildcard). Types: main_user_text, "
-                             "main_assistant_text, main_assistant_thinking, main_tool_input, main_tool_output, "
-                             "main_summary, agent_input_text, agent_assistant_text, agent_assistant_thinking, "
-                             "agent_tool_input, agent_tool_output. Examples: main_*, *_text, *_assistant_*")
+                        help="Record type pattern (supports * wildcard). Types: "
+                             + ", ".join(ALL_TYPES) + ". Examples: main_*, *_text, *_assistant_*. "
+                             "Default: the main_* types (with --agent also agent_*)")
     parser.add_argument("--tool", help="Tool name filter (Bash, Read, Write, Edit, etc.)")
+    parser.add_argument("--origin", metavar="ORIGIN",
+                        help="Only messages of this origin: " + ", ".join(ORIGINS) + " (others as Claude Code "
+                             "names them, e.g. scheduled)")
     parser.add_argument("-i", "--ignore-case", action="store_true",
                         help="Case-insensitive search")
     parser.add_argument("-r", "--regex", action="store_true", default=True,
@@ -574,19 +743,33 @@ def main():
     parser.add_argument("--last", type=int, help="Return last N results")
     parser.add_argument("-c", "--compact", action="store_true",
                         help="Compact one-line listing: UUID, time, type, content preview")
+    parser.add_argument("--full", action="store_true",
+                        help=f"Print contents in full: no cut after {LISTING_CUT} characters in listings, "
+                             f"none after {EXPAND_CUT} per part with --expand")
+    parser.add_argument("--json", action="store_true",
+                        help="Print results as JSON lines, in full, with a tool call's exact input and an "
+                             "edit's result (originalFile, structuredPatch); for search and --expand")
     parser.add_argument("--after", dest="time_from", metavar="TIME",
                         help="After time (local), e.g. '2025-12-23 10:30:00' (same format as header), or shorter: 10:30, 12-23 10:30")
     parser.add_argument("--before", dest="time_to", metavar="TIME",
                         help="Before time (local), e.g. '2025-12-23 10:30:00' (same format as header), or shorter: 10:30, 12-23 10:30")
-    parser.add_argument("--expand", metavar="UUID", help="Get full context for a UUID")
+    parser.add_argument("--expand", metavar="UUID",
+                        help="Get full context for a UUID, as printed in a result's header "
+                             "(session:uuid, session:agent:uuid, or the uuid alone)")
     parser.add_argument("-C", "--context", type=int, metavar="N",
                         help="Show N messages before and after each match")
     parser.add_argument("--snapshots", nargs="?", const="", metavar="FILENAME",
                         help="List file snapshots (optionally filter by filename)")
     parser.add_argument("--get-snapshot", metavar="ID",
-                        help="Get file content of a snapshot by backup ID (prefix match)")
+                        help="Get file content of a snapshot by backup ID (prefix match), "
+                             "optionally session:ID")
     parser.add_argument("--msgid", metavar="MSGID",
                         help="Filter snapshots by message ID (prefix match)")
+    parser.add_argument("--get-blob", metavar="HASH",
+                        help="Write an image or other binary content named by a placeholder "
+                             "([image sha256:HASH ...]) to --output, or to standard output")
+    parser.add_argument("-o", "--output", metavar="FILE",
+                        help="File to write for --get-blob and --get-snapshot (default: standard output)")
     parser.add_argument("--cwd", help="Working directory")
 
     # Cross-session options
@@ -622,6 +805,11 @@ def main():
         run_expand(args)
         return
 
+    # Mode: get a blob
+    if args.get_blob:
+        run_get_blob(args)
+        return
+
     # Mode: get snapshot (by backup ID only)
     if args.get_snapshot:
         run_get_snapshot(args)
@@ -636,8 +824,102 @@ def main():
     run_search(args)
 
 
+def _cut(text, limit, full):
+    """text, or its first `limit` characters with a note saying how much there is."""
+    if full or len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n[... {limit} of {len(text)} characters shown; --full shows all]"
+
+
+def _write_out(data, output):
+    """Write bytes to the file `output`, or to standard output."""
+    if output:
+        Path(output).write_bytes(data)
+        print(f"Wrote {len(data)} bytes to {output}", file=sys.stderr)
+    else:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+
+
+def _scope(args, db=None):
+    """What the scope options select: (project name, with its subprojects, session id prefix);
+    None where there is no restriction.
+
+    Default: the session this command runs in. --all-sessions: all sessions of its
+    project. --project: all sessions of that project. --session: that session,
+    whichever project it is in. --all-projects: everything.
+    """
+    project_name, with_subdirs, session_id = None, False, args.session
+    if args.all_projects:
+        return None, False, session_id
+    if args.project:
+        with_subdirs = args.project.endswith("/**")
+        project_name = _path_to_project_name(args.project.removesuffix("/**").rstrip("/"))
+    elif not args.session:
+        project_name, current = _current_project_and_session(args, db)
+        if not args.all_sessions:
+            session_id = current
+    return project_name, with_subdirs, session_id
+
+
+def _current_project_and_session(args, db=None):
+    """(project name, session id) that this command runs in, or that --cwd names.
+
+    A project whose folder Claude Code has deleted is still found if the index has it;
+    its newest session then counts as the current one.
+    """
+    project_dirs = resolve_project_dirs(None, args.cwd)
+    if project_dirs:
+        return project_dirs[0].name, get_current_session_id(project_dirs[0])
+    name = _path_to_project_name(args.cwd or os.getcwd())
+    if db is not None:
+        row = db.execute("SELECT session_id FROM sessions WHERE project_name = ? "
+                         "ORDER BY last_ts DESC LIMIT 1", (name,)).fetchone()
+        if row:
+            return name, row[0]
+    _no_project_found()
+
+
+def _split_handle(handle):
+    """A result's handle "session:agent:uuid", "session:uuid", "agent:uuid" or "uuid"
+    -> (prefixes before the uuid, uuid)."""
+    parts = handle.split(":")
+    return parts[:-1], parts[-1]
+
+
 def run_expand(args):
     """Expand a single record by UUID prefix. Supports session:agent:uuid format."""
+    prefixes, uuid_prefix = _split_handle(args.expand)
+    db = open_index()
+    if db is not None:
+        if len(prefixes) >= 2:
+            attempts = [(prefixes[0], prefixes[1])]
+        elif len(prefixes) == 1:
+            # A session id prefix or an agent id prefix
+            attempts = [(prefixes[0], None), (None, prefixes[0])]
+        else:
+            attempts = [(args.session, args.agent)]
+        result, candidates = None, []
+        for session_prefix, agent_prefix in attempts:
+            result, candidates = expand_sqlite(db, uuid_prefix, session_prefix, agent_prefix)
+            if result or candidates:
+                break
+        if candidates:
+            print(f"Several records start with '{args.expand}':", file=sys.stderr)
+            for handle in sorted({_handle(_row_to_result(r)) + f" | {utc_time_to_local(r['timestamp'] or '')}"
+                                  for r in candidates})[:20]:
+                print(f"  {handle}", file=sys.stderr)
+            sys.exit(1)
+        if result:
+            if args.json:
+                for row in result["rows"]:
+                    print(json.dumps(_json_item(row), ensure_ascii=False))
+            else:
+                _print_expanded_result(result, full=args.full)
+            return
+        # Not in the index (yet): look in the transcript files
+
     # Parse the expand argument which could be:
     # - uuid
     # - session:uuid (from multi-session search)
@@ -645,21 +927,14 @@ def run_expand(args):
     # - session:agent:uuid (from multi-session agent search)
     session_id = None
     agent_id = None
-    uuid_prefix = args.expand
-
-    parts = args.expand.split(":")
-    if len(parts) == 3:
-        # session:agent:uuid
-        session_id, agent_id, uuid_prefix = parts
-    elif len(parts) == 2:
-        # Could be session:uuid or agent:uuid
-        # Agent IDs are 7 chars, session IDs are 8 chars
-        prefix, uuid_prefix = parts
-        if len(prefix) == 8:
-            session_id = prefix
+    if len(prefixes) >= 2:
+        session_id, agent_id = prefixes[0], prefixes[1]
+    elif len(prefixes) == 1:
+        # Agent IDs are 7 or 17 characters, session ID prefixes are 8
+        if len(prefixes[0]) == 8:
+            session_id = prefixes[0]
         else:
-            agent_id = prefix
-    # else: just uuid
+            agent_id = prefixes[0]
 
     # If session_id prefix is given, search all projects for matching session
     if session_id:
@@ -672,7 +947,7 @@ def run_expand(args):
                 result = expand_uuid(uuid_prefix, session_files=matching_sessions,
                                      project_dir=project_dir, agent_id=agent_id)
                 if result:
-                    _print_expanded_result(result, agent_id)
+                    _print_expanded_result(dict(result, agent_id=agent_id), full=args.full)
                     return
         print(f"No record found with UUID starting with '{args.expand}'")
         return
@@ -680,6 +955,9 @@ def run_expand(args):
     # No session prefix - use normal project resolution
     project_dirs = resolve_project_dirs(args.project, args.cwd)
     if not project_dirs:
+        if db is not None:
+            print(f"No record found with UUID starting with '{args.expand}'")
+            return
         _no_project_found(args.project)
 
     session_files = resolve_session_files(args, project_dirs[0])
@@ -688,23 +966,68 @@ def run_expand(args):
         print(f"No record found with UUID starting with '{args.expand}'")
         return
 
-    _print_expanded_result(result, agent_id)
+    _print_expanded_result(dict(result, agent_id=agent_id), full=args.full)
 
 
-def _print_expanded_result(result, agent_id=None):
+def _print_expanded_result(result, full=False):
     """Print the expanded record result."""
-    agent_prefix = f"{agent_id}:" if agent_id else ""
-    print(f"== [ {agent_prefix}{result['uuid']} | {result['timestamp']} | {result['type']} ] ==")
+    sid = f"{result['session_id'][:8]}:" if result.get("session_id") else ""
+    agent_prefix = f"{result['agent_id']}:" if result.get("agent_id") else ""
+    print(f"== [ {sid}{agent_prefix}{result['uuid']} | {result['timestamp']} | {result['type']} ] ==")
     if result["content"]:
-        print(f"\n--- Content ---\n{result['content']}")
+        print(f"\n--- Content ---\n{_cut(result['content'], EXPAND_CUT, full)}")
     if result["thinking"]:
-        print(f"\n--- Thinking ---\n{result['thinking']}")
+        print(f"\n--- Thinking ---\n{_cut(result['thinking'], EXPAND_CUT, full)}")
     for tu in result["tool_uses"]:
         print(f"\n--- Tool: {tu['name']} ---")
-        print(f"Input:\n{tu['input']}")
+        if tu["input"] is not None:
+            print(f"Input:\n{_cut(tu['input'], EXPAND_CUT, full)}")
         if tu["output"]:
             output_str = tu["output"] if isinstance(tu["output"], str) else str(tu["output"])
-            print(f"Output:\n{output_str}")
+            label = "Output (error)" if tu.get("is_error") else "Output"
+            print(f"{label}:\n{_cut(output_str, EXPAND_CUT, full)}")
+        if tu.get("result_json"):
+            try:
+                keys = ", ".join(k for k, v in json.loads(tu["result_json"]).items() if v is not None)
+            except ValueError:
+                keys = ""
+            print(f"Result details kept ({keys}): add --json to print them")
+
+
+def run_get_blob(args):
+    """Write the binary content that a placeholder in a text names."""
+    db = open_index()
+    if db is None:
+        print("No index: images are kept in the index only", file=sys.stderr)
+        sys.exit(1)
+    match = PLACEHOLDER_RE.search(args.get_blob)
+    digest = match.group(2) if match else args.get_blob.strip("[]")
+    blobs = get_blob(db, digest)
+    if not blobs:
+        print(f"No blob found with a hash starting with '{digest}'", file=sys.stderr)
+        sys.exit(1)
+    if len(blobs) > 1:
+        print(f"Several blobs start with '{digest}':", file=sys.stderr)
+        for blob_hash, media_type, data in blobs:
+            print(f"  {blob_hash} {media_type} {len(data)} bytes", file=sys.stderr)
+        sys.exit(1)
+    blob_hash, media_type, data = blobs[0]
+    print(f"{blob_hash} {media_type} {len(data)} bytes", file=sys.stderr)
+    _write_out(data, args.output)
+
+
+def _snapshot_bytes(db, snapshot):
+    """A snapshot's content as bytes, or None if neither the index nor the disk has it."""
+    if snapshot["content"] is not None:
+        return snapshot["content"].encode("utf-8", errors="surrogatepass")
+    if snapshot["blob_hash"]:
+        row = db.execute("SELECT data FROM blobs WHERE hash = ?", (snapshot["blob_hash"],)).fetchone()
+        if row:
+            return row[0]
+    try:
+        return (CLAUDE_DIR / "file-history" / snapshot["session_id"] / snapshot["backup_id"]).read_bytes()
+    except (OSError, TypeError):
+        return None
 
 
 def run_get_snapshot(args):
@@ -712,16 +1035,66 @@ def run_get_snapshot(args):
 
     IDs look like "7f35193717348549@v1"; the hash part may be given as a
     prefix ("7f3519@v1"), but the version must match exactly if present.
+    A session id prefix may come first ("ae6a59bd:7f3519@v1"); without it the
+    snapshot is looked for in the current session, then in all sessions.
     """
+    prefixes, wanted = _split_handle(args.get_snapshot)
+    hash_prefix, _, version = wanted.partition("@")
+    db = open_index()
+    if db is None:
+        _run_get_snapshot_jsonl(args, hash_prefix, version)
+        return
+
+    if prefixes:
+        scopes = [dict(session_id=prefixes[0])]
+    elif args.session or args.project or args.all_projects or args.all_sessions:
+        project_name, with_subdirs, session_id = _scope(args, db)
+        scopes = [dict(session_id=session_id, project_name=project_name, with_subdirs=with_subdirs)]
+    else:
+        # The current session if there is one, else anywhere
+        scopes = [{}]
+        project_dirs = resolve_project_dirs(None, args.cwd)
+        if project_dirs:
+            current = get_current_session_id(project_dirs[0])
+            if current:
+                scopes.insert(0, dict(session_id=current))
+    matches = []
+    for scope in scopes:
+        matches = snapshots_sqlite(db, backup_prefix=hash_prefix, version=version or None, **scope)
+        if matches:
+            break
+    if not matches:
+        print(f"No snapshot found with ID starting with '{args.get_snapshot}'", file=sys.stderr)
+        sys.exit(1)
+    contents = {}
+    for s in matches:
+        contents.setdefault(_snapshot_bytes(db, s), []).append(s)
+    if len(contents) > 1:
+        # Different files or versions, or the same backup name with other content in another session
+        print(f"Multiple matches for '{args.get_snapshot}':", file=sys.stderr)
+        for s in matches:
+            print(f"  {s['session_id'][:8]}:{s['backup_id']} | {s['timestamp']} | {s['file_path'] or '?'}",
+                  file=sys.stderr)
+        sys.exit(1)
+    data = next(iter(contents))
+    if data is None:
+        s = matches[0]
+        print(f"The content of {s['session_id'][:8]}:{s['backup_id']} ({s['file_path'] or '?'}) is not in the "
+              "index: its backup file was gone before the indexer saw it", file=sys.stderr)
+        sys.exit(1)
+    _write_out(data, args.output)
+
+
+def _run_get_snapshot_jsonl(args, hash_prefix, version):
+    """--get-snapshot without an index: from the current session's transcript and backup files."""
     snapshots = list_snapshots(None, args.cwd)
-    if "@" in args.get_snapshot:
-        hash_prefix, _, version = args.get_snapshot.partition("@")
+    if version:
         def id_matches(sid):
             sid_hash, _, sid_version = sid.partition("@")
             return sid_hash.startswith(hash_prefix) and sid_version == version
     else:
         def id_matches(sid):
-            return sid.startswith(args.get_snapshot)
+            return sid.startswith(hash_prefix)
     matches = [s for s in snapshots if id_matches(s['id'])]
     if not matches:
         print(f"No snapshot found with ID starting with '{args.get_snapshot}'", file=sys.stderr)
@@ -734,8 +1107,8 @@ def run_get_snapshot(args):
             print(f"  {sid}", file=sys.stderr)
         sys.exit(1)
     s = next(iter(unique.values()))
-    if s["content"]:
-        print(s["content"])
+    if s["data"] is not None:
+        _write_out(s["data"], args.output)
 
 
 def run_snapshots(args):
@@ -750,6 +1123,59 @@ def run_snapshots(args):
         print(f"Invalid --before time format: {args.time_to}", file=sys.stderr)
         sys.exit(1)
 
+    db = open_index()
+    if db is not None:
+        project_name, with_subdirs, session_id = _scope(args, db)
+        rows = snapshots_sqlite(db, session_id=session_id, project_name=project_name,
+                                with_subdirs=with_subdirs, filename_filter=args.snapshots or None,
+                                msgid=args.msgid, time_from=time_from, time_to=time_to, term=args.term)
+        several_sessions = len({r["session_id"] for r in rows}) > 1
+        snapshots = []
+        for r in rows:
+            content = r["content"]
+            if content is not None:
+                size = f"{r['size'] or 0} bytes"
+            elif r["blob_hash"]:
+                size = f"{r['size'] or 0} bytes, binary"
+            else:
+                # Named in the transcript, but the backup file was gone before the indexer saw it
+                size = "content not in the index"
+            snapshots.append({
+                "id": (f"{r['session_id'][:8]}:" if several_sessions else "") + r["backup_id"],
+                "msg_id": (r["message_id"] or "")[:12], "timestamp": r["timestamp"],
+                "file": r["file_path"] or "?", "content": content, "size": size})
+    else:
+        snapshots = _snapshots_jsonl(args, time_from, time_to)
+
+    if not snapshots:
+        print("No snapshots found")
+        return
+
+    for s in snapshots:
+        if args.compact:
+            print(f"[ {s['id']:20} | {s['msg_id']} | {s['timestamp']} | {s['file']} ({s['size']}) ]")
+        else:
+            print(f"== [ {s['id']} | {s['msg_id']} | {s['timestamp']} | {s['file']} ({s['size']}) ] ==")
+            if s["content"]:
+                if args.term:
+                    # Show matching lines with context
+                    lines = s["content"].splitlines()
+                    term_lower = args.term.lower()
+                    for i, line in enumerate(lines):
+                        if term_lower in line.lower():
+                            context = lines[max(0, i-1):i+2]
+                            for ctx_line in context:
+                                print(f"    {ctx_line[:120]}")
+                            break  # Only show first match per file
+                else:
+                    lines = s["content"].splitlines()[:3]
+                    for line in lines:
+                        print(f"    {line[:120]}")
+            print()
+
+
+def _snapshots_jsonl(args, time_from, time_to):
+    """--snapshots without an index: from the current session's transcript and backup files."""
     snapshots = list_snapshots(
         args.snapshots if args.snapshots else None,
         args.cwd
@@ -775,31 +1201,7 @@ def run_snapshots(args):
     if args.term:
         snapshots = [s for s in snapshots if s['content'] and args.term.lower() in s['content'].lower()]
 
-    if not snapshots:
-        print("No snapshots found")
-        return
-
-    for s in snapshots:
-        if args.compact:
-            print(f"[ {s['id']:20} | {s['msg_id']} | {utc_to_local(s['timestamp'])} | {s['file']} ({s['size']} bytes) ]")
-        else:
-            print(f"== [ {s['id']} | {s['msg_id']} | {utc_to_local(s['timestamp'])} | {s['file']} ({s['size']} bytes) ] ==")
-            if s["content"]:
-                if args.term:
-                    # Show matching lines with context
-                    lines = s["content"].splitlines()
-                    term_lower = args.term.lower()
-                    for i, line in enumerate(lines):
-                        if term_lower in line.lower():
-                            context = lines[max(0, i-1):i+2]
-                            for ctx_line in context:
-                                print(f"    {ctx_line[:120]}")
-                            break  # Only show first match per file
-                else:
-                    lines = s["content"].splitlines()[:3]
-                    for line in lines:
-                        print(f"    {line[:120]}")
-            print()
+    return [dict(s, timestamp=utc_to_local(s['timestamp']), size=f"{s['size']} bytes") for s in snapshots]
 
 
 def run_search(args):
@@ -823,9 +1225,10 @@ def run_search(args):
     # Compile search pattern (validates regex before either backend runs)
     matcher = compile_search_pattern(args.term, args.ignore_case, args.regex)
 
-    # Try SQLite first (unless context mode, which needs JSONL for now)
-    if not args.context and db_available():
-        results = _run_search_sqlite(args, type_list, time_from, time_to, matcher)
+    # The index first; without one, the transcript files
+    db = open_index()
+    if db is not None:
+        results = _run_search_sqlite(db, args, type_list, time_from, time_to, matcher)
         if results is not None:
             _display_results(results, args)
             return
@@ -850,8 +1253,6 @@ def run_search(args):
         print("No sessions found")
         return
 
-    multi_session = len(session_files) > 1 or len(project_dirs) > 1
-
     all_results = []
 
     def do_search(history_file, agent_id=None):
@@ -865,6 +1266,7 @@ def run_search(args):
                 history_file=history_file,
                 context_n=args.context,
                 agent_id=agent_id,
+                origin=args.origin,
             )
         else:
             return search_history(
@@ -875,6 +1277,7 @@ def run_search(args):
                 time_to=time_to,
                 history_file=history_file,
                 agent_id=agent_id,
+                origin=args.origin,
             )
 
     for sf in session_files:
@@ -914,64 +1317,19 @@ def run_search(args):
             if args.last:
                 all_results = all_results[-args.last:]
 
-    if not all_results:
-        print("No results found")
-        return
-
-    prev_context_for = None
-    for r in all_results:
-        sid = f"{r['session_id']}:" if multi_session else ""
-        # Show agent ID prefix for agent results
-        agent_prefix = f"{r['agent_id']}:" if r.get("agent_id") else ""
-        is_match = r.get("is_match", True)
-        marker = ">" if is_match and args.context else " "
-
-        # Print separator between context groups
-        if args.context and r.get("context_for") != prev_context_for and prev_context_for is not None:
-            print("---")
-        prev_context_for = r.get("context_for")
-
-        # Format type label for display
-        type_label = r["type"]
-        if r.get("tool_name"):
-            type_label = f"{r['type']}:{r['tool_name']}"
-
-        content = r.get("content", "") or ""
-
-        if args.compact:
-            preview = content.replace("\n", " ").strip()[:80]
-            print(f"[{marker}{sid}{agent_prefix}{r['uuid']} | {r['timestamp']} | {type_label:25} ] {preview}")
-        else:
-            print(f"=={marker}[ {sid}{agent_prefix}{r['uuid']} | {r['timestamp']} | {type_label} ] ==")
-            if content:
-                print(content[:2000])
-            print()
+    _display_results(all_results, args)
 
 
-def _run_search_sqlite(args, type_list, time_from, time_to, matcher):
+def _run_search_sqlite(db, args, type_list, time_from, time_to, matcher):
     """Run search using SQLite. Returns results or None to fall back to JSONL."""
-    # Match the JSONL path's default scope: main types only, plus agent types
-    # when --agent is given. Agent/plan records require an explicit -t.
+    # Default scope: main types only, plus agent types when --agent is given.
+    # Agent records and files (plans, memory, ...) require an explicit -t.
     if type_list is None:
         type_list = MAIN_TYPES + (AGENT_TYPES if args.agent else [])
 
-    # Determine project and session filters
-    project_name = None
-    session_id = args.session
-
-    if args.project:
-        project_name = _path_to_project_name(args.project.removesuffix("/**").rstrip("/"))
-    elif not args.all_projects and not args.session:
-        # Default: the session this command runs in, whatever the shell's cwd
-        # (session IDs are unique, so an explicit --session needs no project)
-        project_dirs = resolve_project_dirs(None, args.cwd)
-        if not project_dirs:
-            _no_project_found()
-        project_name = project_dirs[0].name
-        if not args.all_sessions:
-            session_id = get_current_session_id(project_dirs[0])
-
+    project_name, with_subdirs, session_id = _scope(args, db)
     results = search_sqlite(
+        db,
         term=args.term,
         matcher=matcher,
         is_regex=args.regex,
@@ -979,9 +1337,11 @@ def _run_search_sqlite(args, type_list, time_from, time_to, matcher):
         tool=args.tool,
         time_from=time_from,
         time_to=time_to,
-        project_name=project_name if not args.all_projects else None,
+        project_name=project_name,
+        with_subdirs=with_subdirs,
         session_id=session_id,
-        agent_id=args.agent if hasattr(args, 'agent') else None,
+        agent_id=args.agent,
+        origin=args.origin,
         ignore_case=args.ignore_case,
     )
 
@@ -994,40 +1354,81 @@ def _run_search_sqlite(args, type_list, time_from, time_to, matcher):
     if args.last:
         results = results[-args.last:]
 
+    if args.context:
+        results = context_sqlite(db, results, args.context)
+
     return results
 
 
-def _display_results(results, args, multi_session=True):
+def _handle(r):
+    """What names a result in a header and for --expand: session:agent:uuid."""
+    sid = f"{r['session_id'][:8]}:" if r.get("session_id") else ""
+    agent_prefix = f"{r['agent_id']}:" if r.get("agent_id") else ""
+    return f"{sid}{agent_prefix}{(r.get('uuid') or '')[:12]}"
+
+
+def _json_item(r):
+    """A result as a JSON object: the index's columns, the stored JSON parsed."""
+    item = {key: r.get(key) for key in ("uuid", "session_id", "agent_id", "timestamp", "type", "tool_name",
+                                        "tool_use_id", "origin", "model", "source_file")}
+    item["content"] = r.get("content") or ""
+    if r.get("is_error"):
+        item["is_error"] = True
+    for key, name in (("input_json", "input"), ("result_json", "result")):
+        if r.get(key):
+            try:
+                item[name] = json.loads(r[key])
+            except ValueError:
+                item[name] = r[key]
+    if "is_match" in r:
+        item["is_match"] = r["is_match"]
+    return item
+
+
+def _display_results(results, args):
     """Display search results."""
     if not results:
         print("No results found")
         return
 
-    for r in results:
-        sid = f"{r.get('session_id', '')[:8]}:" if multi_session and r.get('session_id') else ""
-        agent_prefix = f"{r['agent_id']}:" if r.get("agent_id") else ""
+    if args.json:
+        for r in results:
+            print(json.dumps(_json_item(r), ensure_ascii=False))
+        return
 
+    prev_context_for = None
+    for r in results:
+        marker = (">" if r.get("is_match", True) else " ") if args.context else " "
+
+        # Print separator between context groups
+        if args.context and r.get("context_for") != prev_context_for and prev_context_for is not None:
+            print("---")
+        prev_context_for = r.get("context_for")
+
+        # Type label: with the tool's name, or where a message came from if not from the human
         type_label = r["type"]
         if r.get("tool_name"):
             type_label = f"{r['type']}:{r['tool_name']}"
+        elif r.get("origin") and r["origin"] != "human":
+            type_label = f"{r['type']}:{r['origin']}"
 
         content = r.get("content", "") or ""
-        uuid = r.get("uuid", "")[:12]
         timestamp = r.get("timestamp", "")
 
         if args.compact:
             preview = content.replace("\n", " ").strip()[:80]
-            print(f"[ {sid}{agent_prefix}{uuid} | {timestamp} | {type_label:25} ] {preview}")
+            print(f"[{marker}{_handle(r)} | {timestamp} | {type_label:25} ] {preview}")
         else:
-            print(f"== [ {sid}{agent_prefix}{uuid} | {timestamp} | {type_label} ] ==")
+            print(f"=={marker}[ {_handle(r)} | {timestamp} | {type_label} ] ==")
             if content:
-                print(content[:2000])
+                print(_cut(content, LISTING_CUT, args.full))
             print()
 
 
 def run_list_projects(args):
     """List all projects."""
-    projects = list_projects()
+    db = open_index()
+    projects = projects_sqlite(db) if db is not None else list_projects()
     if not projects:
         print("No projects found")
         return
@@ -1037,26 +1438,53 @@ def run_list_projects(args):
 
 def run_list_sessions(args):
     """List sessions in a project."""
-    project_dirs = resolve_project_dirs(args.project, args.cwd, all_projects=args.all_projects)
-    if not project_dirs:
-        _no_project_found(args.project)
+    db = open_index()
+    if db is not None:
+        project_name, with_subdirs = None, False
+        current_id = None
+        if args.project and not args.all_projects:
+            with_subdirs = args.project.endswith("/**")
+            project_name = _path_to_project_name(args.project.removesuffix("/**").rstrip("/"))
+        if not args.cwd:
+            current_id = detect_current_session()[1]
+        if not args.project and not args.all_projects:
+            project_name, newest = _current_project_and_session(args, db)
+            current_id = current_id or newest
+        sessions = sessions_sqlite(db, project_name, with_subdirs, detailed=not args.compact)
+        groups = {}
+        for s in sessions:
+            groups.setdefault(s["project"], []).append(s)
+    else:
+        project_dirs = resolve_project_dirs(args.project, args.cwd, all_projects=args.all_projects)
+        if not project_dirs:
+            _no_project_found(args.project)
 
-    # For current session detection, only check current project
-    current_proj = resolve_project_dirs(None, args.cwd)
-    current_id = get_current_session_id(current_proj[0]) if current_proj else None
+        # For current session detection, only check current project
+        current_proj = resolve_project_dirs(None, args.cwd)
+        current_id = get_current_session_id(current_proj[0]) if current_proj else None
+        groups = {pd.name: [dict(s, on_disk=True) for s in list_sessions(pd, detailed=not args.compact)]
+                  for pd in project_dirs}
 
-    for pd in project_dirs:
-        if len(project_dirs) > 1:
-            print(f"\n{pd.name}:")
-        for s in list_sessions(pd, detailed=not args.compact):
+    if not groups:
+        print("No sessions found")
+        return
+    for project, sessions in groups.items():
+        if len(groups) > 1:
+            print(f"\n{project}:")
+        for s in sessions:
             marker = " *" if s["id"] == current_id else "  "
+            gone = "" if s["on_disk"] else " (transcript deleted; in the index)"
+            title = s.get("title") or ""
             if args.compact:
-                print(f"[{marker}{s['id'][:8]} | {s['mtime']} | {s['msgs']:3} msgs ] {s['preview'][:60]}")
+                print(f"[{marker}{s['id'][:8]} | {s['mtime']} | {s['msgs']:3} msgs ] "
+                      f"{(title or s['preview'])[:60]}{gone}")
             else:
                 duration = s.get("duration", "")
                 files = s.get("files_edited", 0)
                 tools = ", ".join(f"{k}:{v}" for k, v in sorted(s.get("tools", {}).items(), key=lambda x: -x[1])[:3])
-                print(f"[{marker}{s['id'][:8]} | {s['mtime']} | {s['msgs']:3} msgs | {duration:>12} | {files:2} files ]")
+                print(f"[{marker}{s['id'][:8]} | {s['mtime']} | {s['msgs']:3} msgs | {duration:>12} | {files:2} files ]{gone}")
+                if title:
+                    print(f"    title: {title}")
                 if tools:
                     print(f"    tools: {tools}")
                 if s['preview']:
@@ -1271,11 +1699,12 @@ def _path_to_project_name(path):
 def resolve_session_files(args, project_dir):
     """Get list of session files to search based on args."""
     all_sessions = _session_files(project_dir)
-    if args.all_sessions:
-        return _by_mtime(all_sessions)
     if args.session:
         # Prefix match on session ID
         return _by_mtime(f for f in all_sessions if f.stem.startswith(args.session))
+    # As with the index: a named project, or all projects, means all of their sessions
+    if args.all_sessions or args.project or args.all_projects:
+        return _by_mtime(all_sessions)
     # Default: current/most recent session only
     sid = get_current_session_id(project_dir)
     f = project_dir / f"{sid}.jsonl" if sid else None
@@ -1697,6 +2126,7 @@ def search_with_context(
     history_file=None,
     context_n=1,
     agent_id=None,
+    origin=None,
 ):
     """Search with N messages of context before/after each match.
 
@@ -1719,7 +2149,7 @@ def search_with_context(
     match_indices = set()
 
     for idx, vr in enumerate(virtual_records):
-        if not _vr_matches(vr, matcher, type_list, tool, time_from, time_to):
+        if not _vr_matches(vr, matcher, type_list, tool, time_from, time_to, origin):
             continue
         match_indices.add(idx)
 
@@ -1753,12 +2183,15 @@ def search_with_context(
     return results
 
 
-def _vr_matches(vr, matcher, type_list, tool, time_from, time_to):
+def _vr_matches(vr, matcher, type_list, tool, time_from, time_to, origin=None):
     """Check if virtual record matches search criteria."""
     if type_list and vr["type"] not in type_list:
         return False
 
     if tool and vr.get("tool_name") != tool:
+        return False
+
+    if origin and vr.get("origin") != origin:
         return False
 
     if time_from or time_to:
@@ -1784,6 +2217,7 @@ def search_history(
     history_file=None,
     cwd=None,
     agent_id=None,
+    origin=None,
 ):
     """Search history with filters using virtual record types.
 
@@ -1817,6 +2251,9 @@ def search_history(
 
             # Tool name filter
             if tool and vr.get("tool_name") != tool:
+                continue
+
+            if origin and vr.get("origin") != origin:
                 continue
 
             # Content filter
@@ -1927,14 +2364,16 @@ def list_snapshots(filename_filter=None, cwd=None):
 
             # Read actual content from backup file
             content = None
+            data = None
             size = 0
             if backup_filename and file_history_dir.exists():
                 backup_path = file_history_dir / backup_filename
                 if backup_path.exists():
                     try:
-                        content = backup_path.read_text()
-                        size = len(content)
-                    except Exception:
+                        data = backup_path.read_bytes()
+                        content = data.decode("utf-8", errors="replace")
+                        size = len(data)
+                    except OSError:
                         content = "(unable to read)"
 
             snapshots.append({
@@ -1943,6 +2382,7 @@ def list_snapshots(filename_filter=None, cwd=None):
                 "timestamp": backup_time,
                 "file": filepath,
                 "content": content,
+                "data": data,
                 "size": size,
                 "backup_file": backup_filename,
             })
@@ -2151,4 +2591,10 @@ def parse_local_time(ts):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # The reader (head, a pager) closed the pipe: stop quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(141)
