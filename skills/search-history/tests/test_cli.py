@@ -31,7 +31,7 @@ class CliCase(IndexerCase):
             assistant(3, [tool_use("t1", "Write", {"file_path": "/home/user/proj/a.py", "content": BODY})], 1),
             user(4, [tool_result("t1", [{"type": "text", "text": "written"}, image_block()])], 2),
             queued(5, "also check the logs", 2),
-            user(6, "report from the agent", 3, isMeta=True, origin={"kind": "peer"}),
+            user(6, "report from the agent\r\nsecond line", 3, isMeta=True, origin={"kind": "peer"}),
             assistant(7, [tool_use("t2", "Edit", {"file_path": "/home/user/proj/a.py", "old_string": "old text",
                                                   "new_string": "new text", "replace_all": False})], 4),
             user(8, [tool_result("t2", "The file /home/user/proj/a.py has been updated.")], 4,
@@ -84,7 +84,7 @@ class FromTheIndexAlone(CliCase):
     def test_search_by_session_and_origin(self):
         out = self.text("-c", "--session", SESSION[:8])
         self.assertIn(f"[ {SESSION[:8]}:{uid(1)[:12]} | 2026-01-15 12:00:00 | main_user_text ", out)
-        self.assertIn("main_meta_text:agent", out)
+        self.assertIn("main_meta_text:agent      ] report from the agent second line\n", out)  # one line per item
         self.assertNotIn("agent_input_text", out)  # agents only with -t or --agent
         self.assertNotIn("unrelated", out)
         typed = self.text("-c", "--session", SESSION[:8], "-t", "main_user_text")

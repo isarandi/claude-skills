@@ -1416,7 +1416,8 @@ def _display_results(results, args):
         timestamp = r.get("timestamp", "")
 
         if args.compact:
-            preview = content.replace("\n", " ").strip()[:80]
+            # One line per item, whatever line breaks the text has
+            preview = " ".join(content[:400].split())[:80]
             print(f"[{marker}{_handle(r)} | {timestamp} | {type_label:25} ] {preview}")
         else:
             print(f"=={marker}[ {_handle(r)} | {timestamp} | {type_label} ] ==")
