@@ -107,11 +107,12 @@ class Transcripts(IndexerCase):
         self.indexer.index_jsonl(self.main, force=True)
         self.assertEqual(len(self.rows()), 2)
 
-    def test_only_new_lines_are_read(self):
+    def test_changed_file_is_read_whole_again(self):
         records, _ = self.conversation()
         write_jsonl(self.main, records)
         self.index()
         size = self.main.stat().st_size
+        before = len(self.rows())
         info = self.indexer.get_indexed_info(self.main)
         self.assertEqual((info["byte_offset"], info["index_version"]), (size, daemon.INDEX_VERSION))
 
@@ -127,14 +128,38 @@ class Transcripts(IndexerCase):
         original = self.indexer.index_record
         self.indexer.index_record = lambda rec, *a: parsed.append(rec.get("uuid")) or original(rec, *a)
         self.assertEqual(self.indexer.index_jsonl(self.main), 1)
-        self.assertEqual(parsed, [uid(7)])  # nothing before the stored offset was parsed again
+        # Every line was parsed again, from the first; the rows that existed are not doubled
+        self.assertEqual(parsed, [r.get("uuid") for r in records] + [uid(7)])
+        self.assertEqual(len(self.rows()), before + 1)
         self.assertEqual(self.one("content = 'one more thing'")["byte_offset"], size)
+        self.indexer.index_record = original
         # The tool result of a call from an earlier pass still gets the tool's name
         write_jsonl(self.main, [assistant(8, [tool_use("t9", "Bash", {"command": "ls"})], 6)], mode="a")
         self.indexer.index_jsonl(self.main)
         write_jsonl(self.main, [user(9, [tool_result("t9", "a.py")], 6)], mode="a")
         self.indexer.index_jsonl(self.main)
         self.assertEqual(self.one("record_type = 'main_tool_output' AND tool_use_id = 't9'")["tool_name"], "Bash")
+
+    def test_line_changed_before_the_old_end_is_found(self):
+        # Why a changed transcript is read whole (see the note in Indexer.index_jsonl):
+        # Claude Code changed an earlier line and appended one. The file's length up to
+        # the old end and the bytes just before it are as they were, so a reader that
+        # went on from a stored position would see the appended line only.
+        filler = [user(n, f"filler message {n} " + "x" * 80, n, origin={"kind": "human"}) for n in (3, 4, 5, 6)]
+        first = user(1, "the first message", 0, origin={"kind": "human"})
+        write_jsonl(self.main, [first] + filler)
+        self.index()
+        size = self.main.stat().st_size
+        sig_before = self.indexer.get_indexed_info(self.main)["tail_sig"]
+        replaced = user(2, "the other message", 0, origin={"kind": "human"})
+        self.assertEqual(len(json.dumps(replaced)), len(json.dumps(first)))
+        write_jsonl(self.main, [replaced] + filler + [user(7, "appended later", 7, origin={"kind": "human"})])
+        with open(self.main, "rb") as f:
+            self.assertEqual(self.indexer.tail_sig(f, size), sig_before)  # the rewrite is not visible there
+        self.assertEqual(self.indexer.index_jsonl(self.main), 2)
+        self.assertEqual(self.one("content = 'the other message'")["byte_offset"], 0)
+        self.assertEqual(self.one("content = 'appended later'")["byte_offset"], size)
+        self.assertEqual(self.one("content = 'the first message'")["uuid"], uid(1)[:12])  # nothing is removed
 
     def test_rewritten_file_is_read_again_without_duplicates(self):
         records, _ = self.conversation()

@@ -20,6 +20,10 @@ Transcripts and snapshots are followed with inotify on Linux (polling elsewhere,
 or when inotify_simple is missing); everything is rescanned every
 FULL_SYNC_INTERVAL seconds, which also picks up the other files.
 
+A changed transcript is always read again from its first byte. DO NOT change this
+to reading only the bytes added since the last pass (see index_jsonl): Claude Code
+does not only append to these files, so a stored position cannot be trusted.
+
     daemon.py                   run until stopped
     daemon.py --once            bring the index up to date (migrating an older one) and exit
     daemon.py --ingest FILE --as PATH
@@ -589,27 +593,44 @@ class HistoryIndexer:
         f.seek(offset - n)
         return hashlib.sha1(f.read(n)).hexdigest()
 
-    def resume_offset(self, path, st, info):
-        """Where to go on reading a file that only grew, or None if it must be read again."""
+    def visibly_rewritten(self, path, st, info):
+        """Whether the bytes up to the end of the last pass are visibly not the same any more.
+
+        Only a hint for bringing existing rows up to date (see index_jsonl). It is never
+        used to decide where to start reading, and a False does not mean "unchanged":
+        a change that keeps the last 256 bytes before the old end in place is not seen.
+        """
         offset = info['byte_offset'] or 0
         if (info['index_version'] or 0) < INDEX_VERSION or offset > st.st_size:
-            return None
+            return True
         if offset == 0:
-            return 0
+            return False
         try:
             with open(path, 'rb') as f:
-                if self.tail_sig(f, offset) != info['tail_sig']:
-                    return None  # rewritten (Claude Code compacts transcripts)
+                return self.tail_sig(f, offset) != info['tail_sig']
         except OSError:
-            return None
-        return offset
+            return True
 
     def index_jsonl(self, file_path, as_path=None, force=False):
-        """Index a transcript: the lines added since last time, or all of it.
+        """Index a transcript. A changed file is read whole, from its first byte, every time.
 
-        A file that only grew is read from the stored offset and its items are
-        inserted. A file known from an older index version, or one that was
-        rewritten, is read from the start and its rows are updated in place.
+        NOTE, DO NOT OPTIMIZE THIS: do not read only the bytes added since the last
+        pass (seek to a stored offset). It was done before this repository's history
+        begins (the byte_offset column of indexed_files remains from it) and again in
+        the first commit of index format 2 (4fba9d5, 2026-11-18, release v1.0.0), and
+        taken out both times. Claude Code does not only append to a transcript: it rewrites files and
+        changes earlier lines, so the JSON before a stored position can change and
+        positions can shift. A reader that trusts the position then skips records or
+        starts in the middle of a line, and nothing reports it. A hash of the bytes
+        before the position (tail_sig) catches a shift, but not a change that leaves
+        those bytes in place. Reading everything and letting INSERT OR IGNORE skip
+        the rows that exist has no such case; its cost is CPU time only.
+
+        Items that are not in the index yet are inserted; existing rows are left as
+        they are. Existing rows are also brought up to date (their content and their
+        place in the file, which orders the context of a match) when the file is
+        known from an older index version, when it was visibly rewritten, or with
+        force.
         as_path: the path to record instead of file_path (see --ingest).
         Returns the number of rows added.
         """
@@ -623,18 +644,14 @@ class HistoryIndexer:
             return 0
 
         info = self.get_indexed_info(key)
-        offset, update = 0, force
-        if info and not force:
-            offset = self.resume_offset(path, st, info)
-            if offset is None:
-                offset, update = 0, True
+        update = force or (info is not None and self.visibly_rewritten(path, st, info))
 
         ctx = FileContext(Path(key))
         added = 0
+        offset = 0  # the end of the last complete line; stored as a sign of a later rewrite
         try:
             with open(path, 'rb') as f:
-                f.seek(offset)
-                while True:
+                while True:  # from the first byte: see the note above
                     line_start = f.tell()
                     line = f.readline()
                     if not line:
@@ -928,7 +945,10 @@ class HistoryIndexer:
         return added
 
     def index_prompt_history(self):
-        """Index new lines of history.jsonl: what was typed at the prompt, with pasted texts."""
+        """Index history.jsonl: what was typed at the prompt, with pasted texts.
+
+        Read whole each time it changed, like a transcript (see the note in index_jsonl).
+        """
         path = self.history_file
         key = str(path)
         try:
@@ -937,11 +957,9 @@ class HistoryIndexer:
             return 0
         if self.unchanged(key, st):
             return 0
-        info = self.get_indexed_info(key)
-        offset = (self.resume_offset(path, st, info) if info else 0) or 0
+        offset = 0
         added = 0
         with open(path, "rb") as f:
-            f.seek(offset)
             while True:
                 line = f.readline()
                 if not line:
