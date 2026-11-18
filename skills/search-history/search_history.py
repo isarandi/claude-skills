@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Search conversation history with filtering by message type, tool, and scope."""
 import argparse
+import base64
+import binascii
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -12,27 +15,52 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# SQLite database path (outside ~/.claude to avoid triggering Claude's watchers)
-DB_PATH = Path.home() / ".local/share/claude-history-index/history.db"
+# Claude Code's directory (CLAUDE_CONFIG_DIR is Claude Code's own override)
+CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+# SQLite database path (outside ~/.claude to avoid triggering Claude's watchers).
+# CLAUDE_HISTORY_DB points the search at another index, such as a copy or a backup.
+DB_PATH = Path(os.environ.get("CLAUDE_HISTORY_DB")
+               or Path.home() / ".local/share/claude-history-index/history.db")
 
 # Index format version, kept in the database's PRAGMA user_version.
 # 0: timestamps in the indexer process's local time zone.
 # 1: timestamps in UTC; transcript records other than user/assistant messages not indexed.
-INDEX_VERSION = 1
+# 2: tool inputs in full; images and other binary data in the blobs table, a placeholder
+#    in the text; messages delivered mid-turn, side files (tool results, memory, subagent
+#    meta, prompt history) and sessions indexed; snapshots keyed by session.
+INDEX_VERSION = 2
 
 # Timestamp format of the index (UTC from version 1 on) and of the output (local time)
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # All valid record types
-ALL_TYPES = [
-    "main_user_text", "main_assistant_text", "main_assistant_thinking",
+MAIN_TYPES = [
+    "main_user_text",           # what the human typed (also local commands and their output)
+    "main_meta_text",           # text put into the conversation by something else: messages
+                                # from agents, task notifications, reminders, skill bodies
+    "main_assistant_text", "main_assistant_thinking",
     "main_tool_input", "main_tool_output", "main_summary",
-    "agent_input_text", "agent_assistant_text", "agent_assistant_thinking",
-    "agent_tool_input", "agent_tool_output",
-    "plan",  # Plan files
 ]
-AGENT_TYPES = [t for t in ALL_TYPES if t.startswith("agent_")]
-MAIN_TYPES = [t for t in ALL_TYPES if t.startswith("main_")]
+AGENT_TYPES = [
+    "agent_input_text",         # the agent's prompt and the messages sent to it
+    "agent_meta_text",          # reminders and skill bodies inside an agent's transcript
+    "agent_assistant_text", "agent_assistant_thinking",
+    "agent_tool_input", "agent_tool_output", "agent_summary",
+]
+# Files next to the transcripts. Searched only when -t names them.
+FILE_TYPES = [
+    "plan",                     # ~/.claude/plans/*.md (each version)
+    "memory",                   # projects/<project>/memory/** (each version)
+    "tool_file",                # <session>/tool-results/*: files saved by tools
+    "subagent_meta",            # <session>/subagents/agent-*.meta.json
+    "prompt_history",           # ~/.claude/history.jsonl with its pasted texts
+    "paste",                    # ~/.claude/paste-cache/*
+]
+ALL_TYPES = MAIN_TYPES + AGENT_TYPES + FILE_TYPES
+
+# What a message's origin can be (the --origin filter); others are stored as Claude Code names them
+ORIGINS = ["human", "agent", "coordinator", "task-notification"]
 
 
 # -----------------------------------------------------------------------------
@@ -524,7 +552,7 @@ def compile_search_pattern(term, ignore_case=False, is_regex=False):
         else:
             return lambda content: term in content
 
-PROJECTS_DIR = Path.home() / ".claude/projects"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
 
 
 def main():
@@ -1386,96 +1414,263 @@ def _get_text_content(content):
     return ""
 
 
-def expand_record(rec, records=None, agent_id=None):
-    """Expand a JSON record into virtual records.
+# -----------------------------------------------------------------------------
+# Transcript records -> searchable items
+# -----------------------------------------------------------------------------
 
-    Main types: main_user_text, main_assistant_text, main_assistant_thinking,
-                main_tool_input, main_tool_output, main_summary
-    Agent types: agent_input_text, agent_assistant_text, agent_assistant_thinking,
-                 agent_tool_input, agent_tool_output
+# What stands in the text for binary content kept in the index's blobs table
+PLACEHOLDER_RE = re.compile(r"\[(image|document|file) sha256:([0-9a-f]{64}) (\S+) (\d+) bytes\]")
 
-    Yields dicts with: type, content, tool_name, uuid, timestamp, agent_id, and original rec reference.
+# toolUseResult fields kept with a tool's output: what an edit needs to be replayed or
+# undone (the file before the edit and the patch), and where a large output was saved
+RESULT_KEYS = ("type", "filePath", "oldString", "newString", "replaceAll", "originalFile",
+               "structuredPatch", "userModified", "bashEditDiff", "persistedOutputPath",
+               "persistedOutputSize")
+RESULT_KEYS_WORTH_KEEPING = ("originalFile", "structuredPatch", "bashEditDiff", "persistedOutputPath")
+
+# Leading tags of user-role text that the human did not type, with the origin they imply
+_LEAD_TAG = re.compile(r"\s*<([a-zA-Z_-]+)[\s>]")
+_LEAD_ORIGIN = {
+    "task-notification": "task-notification",
+    "agent-message": "agent",
+    "cross-session-message": "agent",
+    "system-reminder": None,
+}
+
+
+def blob_placeholder(kind, digest, media_type, size):
+    """The text that stands for a blob: its kind, SHA-256, media type and size."""
+    return f"[{kind} sha256:{digest} {media_type or 'application/octet-stream'} {size} bytes]"
+
+
+def _blob_block(block, blob_sink):
+    """Placeholder for an image or document block holding base64 data, else None.
+
+    blob_sink(data, media_type) stores the decoded bytes and returns their SHA-256;
+    without it the bytes are only hashed.
+    """
+    source = block.get("source")
+    if not isinstance(source, dict) or source.get("type") != "base64":
+        return None
+    data = source.get("data")
+    if not isinstance(data, str):
+        return None
+    try:
+        raw = base64.b64decode(data)
+    except (binascii.Error, ValueError):
+        return None
+    media_type = source.get("media_type") or "application/octet-stream"
+    digest = blob_sink(raw, media_type) if blob_sink else hashlib.sha256(raw).hexdigest()
+    return blob_placeholder(block.get("type") or "file", digest, media_type, len(raw))
+
+
+def render_blocks(blocks, blob_sink=None):
+    """Text of a list of content blocks (a message's content, a tool result, a queued prompt).
+
+    Text blocks are taken as they are; an image or a document becomes a placeholder
+    (see _blob_block); anything else is kept as JSON.
+    """
+    parts = []
+    for block in blocks:
+        if isinstance(block, str):
+            parts.append(block)
+        elif not isinstance(block, dict):
+            parts.append(json.dumps(block, ensure_ascii=False))
+        elif block.get("type") == "text":
+            parts.append(block.get("text") or "")
+        elif block.get("type") in ("image", "document"):
+            parts.append(_blob_block(block, blob_sink) or json.dumps(block, ensure_ascii=False))
+        elif block.get("type") == "tool_reference":
+            parts.append(f"[tool_reference {block.get('tool_name', '')}]")
+        else:
+            parts.append(json.dumps(block, ensure_ascii=False))
+    return "\n".join(parts)
+
+
+# Claude Code's names for origins -> the names used here
+_ORIGIN_NAMES = {"peer": "agent", "task_notification": "task-notification",
+                 "auto_continuation": "auto-continuation"}
+
+
+def _origin_name(origin):
+    """An origin as Claude Code states it ({"kind": ...} or a name) -> its name here, or None."""
+    if isinstance(origin, dict):
+        origin = origin.get("kind")
+    if not isinstance(origin, str) or not origin:
+        return None
+    return _ORIGIN_NAMES.get(origin, origin)
+
+
+def _text_type(agent_id, is_meta, origin, text, turn_origin=None):
+    """(record type, origin) of user-role text.
+
+    In the main conversation main_user_text is what the human typed and
+    main_meta_text everything else; an agent's transcript has agent_input_text
+    (its prompt and the messages sent to it) and agent_meta_text (reminders,
+    skill bodies).
+
+    origin: what the message itself states; it decides the type. Without it the
+    meta flag and a leading tag decide, and turn_origin (what started the turn
+    the message belongs to) only fills in the origin that is returned.
+    """
+    lead_is_meta = False
+    if origin is None:
+        m = _LEAD_TAG.match(text)
+        if m and m.group(1) in _LEAD_ORIGIN:
+            lead_is_meta = True
+            origin = _LEAD_ORIGIN[m.group(1)]
+    shown = origin if origin is not None else turn_origin
+    if agent_id:
+        if origin is None and (is_meta or lead_is_meta):
+            return "agent_meta_text", shown
+        return "agent_input_text", shown
+    if origin == "human" or (origin is None and not is_meta and not lead_is_meta):
+        return "main_user_text", shown
+    return "main_meta_text", shown
+
+
+def expand_record(rec, records=None, agent_id=None, blob_sink=None, read_persisted=None):
+    """Expand a transcript record into searchable items ("virtual records").
+
+    Types: see MAIN_TYPES and AGENT_TYPES. A user or assistant record gives one
+    item for its text (text blocks joined, images as placeholders), one for its
+    thinking, and one per tool call or tool result. An attachment record of type
+    queued_command (a message delivered while Claude was working) gives one text item.
+
+    blob_sink(data, media_type) -> sha256 hex: receives decoded images and documents.
+    read_persisted(path) -> text or None: reads a tool output that Claude Code saved
+    to <session>/tool-results/ and left only a preview of in the transcript.
+
+    Yields dicts with: type, content, tool_name, tool_use_id, uuid, timestamp (local),
+    agent_id, rec (the record), and for the index: legacy_type (the type index
+    version 1 gave the item, if it differs), model, is_meta, origin, parent_uuid,
+    input_json, result_json, is_error, and persisted_missing (a tool output whose
+    saved file could not be read, so that content is only the preview).
     """
     json_type = rec.get("type")
-    # Only user and assistant records are messages. Others can carry message
-    # content too: "api-request-blob" records repeat the API request's messages,
-    # without uuid or timestamp.
-    if json_type not in ("user", "assistant"):
+    # Only user and assistant records are messages, plus the attachments that carry
+    # one. Others can hold message content too: "api-request-blob" records repeat
+    # the API request's messages, without uuid or timestamp.
+    if json_type == "attachment":
+        attachment = rec.get("attachment")
+        if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
+            return
+    elif json_type not in ("user", "assistant"):
         return
 
-    uuid = rec.get("uuid", "")[:12]
+    uuid = (rec.get("uuid") or "")[:12]
     timestamp = utc_to_local(rec.get("timestamp", ""))
-
-    def make_type(base_type):
-        """Convert base type to full type name."""
-        if agent_id:
-            return {
-                "user_text": "agent_input_text",
-                "assistant_text": "agent_assistant_text",
-                "assistant_thinking": "agent_assistant_thinking",
-                "tool_input": "agent_tool_input",
-                "tool_output": "agent_tool_output",
-            }.get(base_type, f"agent_{base_type}")
-        return f"main_{base_type}"
+    parent_uuid = (rec.get("parentUuid") or "")[:12] or None
+    msg = rec.get("message")
+    if not isinstance(msg, dict):
+        msg = {}
+    model = msg.get("model") if json_type == "assistant" else None
+    prefix = "agent_" if agent_id else "main_"
 
     def make_result(vtype, content, tool_name=None, **extra):
-        return {"type": vtype, "content": content, "tool_name": tool_name,
-                "uuid": uuid, "timestamp": timestamp, "agent_id": agent_id, "rec": rec, **extra}
+        result = {"type": vtype, "content": content, "tool_name": tool_name, "tool_use_id": "",
+                  "uuid": uuid, "timestamp": timestamp, "agent_id": agent_id, "rec": rec,
+                  "legacy_type": None, "model": model, "is_meta": False, "origin": None,
+                  "parent_uuid": parent_uuid, "input_json": None, "result_json": None,
+                  "is_error": False, "persisted_missing": False}
+        result.update(extra)
+        return result
 
-    # Summary (compaction) - not in agents
-    if rec.get("isCompactSummary"):
-        text = rec.get("message", {}).get("content", "")
+    def user_text(text, is_meta, origin, legacy=True):
+        vtype, origin = _text_type(agent_id, is_meta, origin, text, _origin_name(rec.get("turnOrigin")))
+        legacy_type = ("agent_input_text" if agent_id else "main_user_text") if legacy else None
+        return make_result(vtype, text, is_meta=is_meta, origin=origin,
+                           legacy_type=legacy_type if legacy_type != vtype else None)
+
+    # A message delivered mid-turn
+    if json_type == "attachment":
+        prompt = attachment.get("prompt")
+        text = render_blocks(prompt, blob_sink) if isinstance(prompt, list) else prompt
         if isinstance(text, str) and text.strip():
-            yield make_result("main_summary", text)
+            origin = _origin_name(attachment.get("origin"))
+            if origin is None and attachment.get("commandMode") == "task-notification":
+                origin = "task-notification"
+            yield user_text(text.strip(), bool(attachment.get("isMeta")), origin, legacy=False)
         return
 
-    msg = rec.get("message", {})
+    # Summary (compaction)
+    if rec.get("isCompactSummary"):
+        text = msg.get("content", "")
+        if isinstance(text, list):
+            text = render_blocks(text, blob_sink)
+        if isinstance(text, str) and text.strip():
+            yield make_result(prefix + "summary", text,
+                              legacy_type="main_summary" if agent_id else None)
+        return
+
     content = msg.get("content", "")
+    is_meta = bool(rec.get("isMeta"))
 
     # Simple string content (user message)
     if isinstance(content, str):
         if json_type == "user" and content.strip():
-            yield make_result(make_type("user_text"), content)
+            yield user_text(content, is_meta, _origin_name(rec.get("origin")))
         return
 
     if not isinstance(content, list):
         return
 
-    # Process content blocks
-    for block in content:
+    blocks = [b for b in content if isinstance(b, dict)]
+
+    # Text, with pasted images and documents in their place
+    text = render_blocks([b for b in blocks if b.get("type") in ("text", "image", "document")],
+                         blob_sink).strip()
+    if text:
+        if json_type == "user":
+            yield user_text(text, is_meta, _origin_name(rec.get("origin")))
+        else:
+            yield make_result(prefix + "assistant_text", text)
+
+    # Thinking. Most thinking blocks carry only a signature and no text.
+    thinking = "\n".join(t for b in blocks if b.get("type") == "thinking"
+                         for t in [(b.get("thinking") or "").strip()] if t)
+    if thinking:
+        yield make_result(prefix + "assistant_thinking", thinking)
+
+    for block in blocks:
         block_type = block.get("type")
 
-        if block_type == "text" and json_type == "user":
-            text = block.get("text", "").strip()
-            if text:
-                yield make_result(make_type("user_text"), text)
-
-        elif block_type == "text" and json_type == "assistant":
-            text = block.get("text", "").strip()
-            if text:
-                yield make_result(make_type("assistant_text"), text)
-
-        elif block_type == "thinking":
-            thinking = block.get("thinking", "").strip()
-            if thinking:
-                yield make_result(make_type("assistant_thinking"), thinking)
-
-        elif block_type == "tool_use":
+        if block_type == "tool_use":
             tool_name = block.get("name", "")
-            tool_input_str = format_tool_input(tool_name, block.get("input", {}))
-            tool_use_id = block.get("id", "")
-            yield make_result(make_type("tool_input"), tool_input_str, tool_name, tool_use_id=tool_use_id)
+            tool_input = block.get("input", {})
+            yield make_result(prefix + "tool_input", format_tool_input(tool_name, tool_input),
+                              tool_name, tool_use_id=block.get("id", ""),
+                              input_json=json.dumps(tool_input, ensure_ascii=False))
 
         elif block_type == "tool_result":
             tool_use_id = block.get("tool_use_id", "")
             result_content = block.get("content", "")
             if isinstance(result_content, list):
-                result_content = "\n".join(str(x.get("text", x)) for x in result_content)
+                result_content = render_blocks(result_content, blob_sink)
+            elif not isinstance(result_content, str):
+                result_content = "" if result_content is None else json.dumps(result_content,
+                                                                             ensure_ascii=False)
+            tool_result = rec.get("toolUseResult")
+            kept, persisted_missing = None, False
+            if isinstance(tool_result, dict):
+                if any(tool_result.get(k) is not None for k in RESULT_KEYS_WORTH_KEEPING):
+                    kept = {k: tool_result[k] for k in RESULT_KEYS if k in tool_result}
+                # A large output: the transcript has a preview, the file has all of it
+                saved = tool_result.get("persistedOutputPath")
+                if read_persisted and isinstance(saved, str) and saved:
+                    full = read_persisted(saved)
+                    if full is not None:
+                        result_content = full
+                    else:
+                        persisted_missing = True
             # Try to find the tool name from the matching tool_use
             tool_name = None
             if records:
                 tool_name = _find_tool_name_for_result(records, tool_use_id)
-            yield make_result(make_type("tool_output"), str(result_content), tool_name, tool_use_id=tool_use_id)
+            yield make_result(prefix + "tool_output", result_content, tool_name,
+                              tool_use_id=tool_use_id, is_error=bool(block.get("is_error")),
+                              result_json=json.dumps(kept, ensure_ascii=False) if kept else None,
+                              persisted_missing=persisted_missing)
 
 
 def _find_tool_name_for_result(records, tool_use_id):
@@ -1706,7 +1901,7 @@ def list_snapshots(filename_filter=None, cwd=None):
 
     # Session ID is the filename without extension
     session_id = history_file.stem
-    file_history_dir = Path.home() / ".claude/file-history" / session_id
+    file_history_dir = CLAUDE_DIR / "file-history" / session_id
 
     records = load_history(cwd)
     snapshots = []
@@ -1836,17 +2031,29 @@ def extract_tool_uses(content):
 
 
 def format_tool_input(tool_name, tool_input):
-    """Format tool input for display."""
-    if tool_name == "Bash":
-        return tool_input.get("command", "")
-    elif tool_name in ("Read", "Glob", "Grep"):
-        return tool_input.get("file_path", "") or tool_input.get("pattern", "") or tool_input.get("path", "")
-    elif tool_name == "Write":
-        return f"{tool_input.get('file_path', '')}\n{tool_input.get('content', '')[:500]}"
-    elif tool_name == "Edit":
-        return f"{tool_input.get('file_path', '')}\n-{tool_input.get('old_string', '')[:200]}\n+{tool_input.get('new_string', '')[:200]}"
-    else:
-        return json.dumps(tool_input)[:500]
+    """A tool call's input as text to search and read, in full.
+
+    Bash: the command. Read: the path. Write: the path, then the content.
+    Edit: the path, then the old text after "-" and the new text after "+".
+    Other tools: one "key: value" line per input field, strings as they are.
+    The exact input is kept beside this as JSON (input_json in the index).
+    """
+    if not isinstance(tool_input, dict):
+        return tool_input if isinstance(tool_input, str) else json.dumps(tool_input, ensure_ascii=False)
+
+    def field(key):
+        value = tool_input.get(key, "")
+        return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+    if tool_name == "Bash" and "command" in tool_input:
+        return field("command")
+    if tool_name == "Read" and "file_path" in tool_input:
+        return field("file_path")
+    if tool_name == "Write" and "file_path" in tool_input:
+        return f"{field('file_path')}\n{field('content')}"
+    if tool_name == "Edit" and "file_path" in tool_input:
+        return f"{field('file_path')}\n-{field('old_string')}\n+{field('new_string')}"
+    return "\n".join(f"{key}: {field(key)}" for key in tool_input)
 
 
 # -----------------------------------------------------------------------------
