@@ -89,7 +89,7 @@ Each record has a type:
 
 The `-t` option accepts shell-style wildcards over these names. By default a search covers the current session only. The `SKILL.md` lists all the options.
 
-`history_db.py` and `plot_activity.py` are older utilities. They build and read a database at `~/.claude/history.db` and are not used by the skill or the daemon.
+`plot_activity.py` plots when the user wrote messages, by time of day, day of the week and date, from the index. It needs matplotlib and is not used by the skill or the daemon.
 
 ## Layout
 
@@ -103,10 +103,9 @@ skills/
     SKILL.md
     search_history.py                search front end; reads the index or the raw JSONL
     daemon.py                        indexer (inotify on Linux, polling on macOS)
-    schema.sql                       index schema (FTS5)
     install.sh                       installs the systemd user unit or launchd agent
     claude-history-indexer.service
-    history_db.py, plot_activity.py  older utilities
+    plot_activity.py                 activity plot from the index
 ```
 
 ## License
